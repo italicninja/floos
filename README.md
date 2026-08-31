@@ -159,8 +159,29 @@ The same list is in the **About** tab in game.
 ## Licence
 
 Floos contains code derived from XIUI and is distributed under the **GNU
-General Public License v3.0**. See `THIRD_PARTY_NOTICES.md` for the full
-notices.
+General Public License v3.0**. The complete licence text is in `LICENSE`; the
+per-component notices are in `THIRD_PARTY_NOTICES.md`.
+
+    Floos - HELM companion for Ashita v4
+    Copyright (C) 2026 the Floos contributors
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+Publishing a modified Floos means publishing your changes under GPL v3 too,
+with source available. That is inherited, not chosen: the panel rendering,
+colour utilities, bitmap gradients, texture manager, window background and
+progress bar are adapted from [XIUI](https://github.com/tirem/XIUI).
 
 The fonts under `assets/fonts/` are Microsoft Windows fonts included for local
 use and are **not** covered by that grant — do not redistribute them publicly

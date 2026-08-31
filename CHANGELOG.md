@@ -1,5 +1,18 @@
 # Floos
 
+## Unreleased - the full GPL v3 text
+
+`LICENSE` held the standard application notice and a to-do saying to replace it
+with the real thing before publishing. A GPL release is expected to ship the
+complete licence, so it now does.
+
+- `LICENSE` is the complete, verbatim GNU GPL v3 text from gnu.org, unaltered.
+- The application notice, and the reason the licence is what it is, moved to
+  the README's Licence section - a notice belongs beside the program, not
+  inside the licence file it points at.
+- `THIRD_PARTY_NOTICES.md` already carried the per-component terms and is
+  unchanged.
+
 ## 1.0.0 - first release (formerly Olenna)
 
 Renamed from **Olenna** to **Floos**. The addon folder, the slash command and
