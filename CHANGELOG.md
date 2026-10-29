@@ -1,3 +1,387 @@
+# Floos 3.3.0
+
+The first public release since 3.2.0. Everything below in "Builds" shipped
+as internal test builds along the way; this is the short version.
+
+- Fatigue is counted per zone, and there is a **Global** counter that follows
+  you between zones - it climbs in the zone you are working and drops one
+  per hit anywhere else. On by default; `/floos global` to inspect it.
+- Accuracy moved under Zone fatigue and is off by default (HELM tab of
+  `/floos config` to show it).
+- New themes: **Itmejammy**, **Beasty**, **Masuru** - each colours the whole
+  panel.
+- A faded picture can sit behind the panel (drop a PNG in
+  `assets/portraits/`, pick it under Appearance).
+- Rotting timber now counts toward fatigue, so the meter matches the server.
+- The rate history is a real chart, the stats are tiles, and the big number
+  glides instead of jumping.
+- `/floos item` shows how often each item drops per zone; `/floos zones`
+  ranks zones again.
+- Clamming shows bucket fill and break odds.
+- `/floos save`, `/floos backup`, `/floos restore` - and a damaged settings
+  file is repaired before Ashita can wipe it; if it does get wiped, you are
+  told.
+- The journal always goes to your character's file.
+- Toggles to stop the panel auto-switching tabs or popping open.
+- Fixed: haul list drawn twice, `/floos clear` hiding the panel, and clearing
+  not resetting the zone counters.
+
+# Builds
+
+## Build 3.8.0
+
+## New
+
+- **Global fatigue.** One counter per activity that follows you between
+  zones. It climbs to the cap in the zone you are working - its *home* - and
+  then every hit in ANY other zone takes one off. So 200/200 in Halvung, walk
+  to Newton, ten hits there, and the Halvung figure reads 190/200. Drain it
+  all the way to zero and the next hit anywhere starts a new home.
+
+  This is the model Tyflow described - "it's still -1 from Zeruhn when you
+  mine anywhere else" - and the addon is the instrument for finding out
+  whether it is right. So it is built exactly as described, **on by
+  default**, and can be set to any number for a test.
+
+      /floos global off          put it away (on by default)
+      /floos global              what it holds, and where its home is
+      /floos global protect off  let /floos clear wipe it (protected by default)
+      /floos global set <n>      put it at a number, for a test
+      /floos global reset        empty it
+
+  Or `/floos config` -> Fatigue -> Global fatigue. On Mine, Logg, Harv and
+  Exca it draws as a **Global** bar directly above Zone fatigue, with the
+  home zone in its label: green while you are away from it (draining), the
+  usual colours while you are in it (climbing). A small `v` after the name
+  means you are away. Digging, fishing, hunting and clamming are untouched.
+
+  The Accuracy meter gave up its slot to make room and now sits under Zone
+  fatigue, off by default: tick "Show Accuracy (under Zone fatigue)" in the
+  HELM tab of `/floos config` to have it back. It is always in
+  `/floos report`, and Dig keeps its own row.
+
+  It is protected from `/floos clear` and Reset Session by default, because
+  a counter that exists to be watched across zones is worthless if clearing
+  a session takes it with it. The protection is its own toggle.
+
+- **Masuru theme.** Green, but the airy kind: deep forest grounds under a
+  cool mint trim. GreenGold is green with gold on it; Masuru is green all the
+  way through. It takes the whole panel, same as Itmejammy and Beasty, and
+  every text colour clears WCAG AA with room to spare. Good is a clear sky
+  blue - on an all-green panel "good" cannot be green - and warn and bad stay
+  warm. Appearance tab, under GreenGold.
+
+## Fixed
+
+- **`/floos clear` hid the panel.** After a clear the tab you are on is
+  blank, so if any other tab held an old session the idle rule saw
+  "activity, none recent" and hid the panel the instant you cleared it. A
+  clear now counts as activity for the Display Timeout.
+- **Stack overflow on the first swing** (`auto_switch_to`, tracker.lua).
+  The helper that follows your activity onto its tab called itself instead
+  of setting the tab, so the first mining packet after loading took the
+  addon down. It now does the one thing it was for.
+
+## Build 3.7.0 (never released - folded into this release)
+
+## New
+
+- **Beasty theme.** Azurite blue over deep water, whole-panel like
+  Itmejammy. Named for Beasty. Picking it loads his portrait if the file is
+  in `assets/portraits/`; nothing is bundled.
+- **Background picture.** A faded picture behind the panel: drop a PNG in
+  `assets/portraits/`, press Rescan, pick it under Appearance. Picture Fade
+  and Picture Width sliders sit with it. Works with every background style,
+  Transparent included.
+- **Follow the activity / Show the panel** toggles under Interface. Both
+  were always on; both can now be switched off.
+
+## Fixed
+
+- **Settings file wiped on a bad shutdown.** Ashita overwrites a settings
+  file it cannot parse with the defaults. Floos now checks every settings
+  file before Ashita reads it, trims a damaged tail back to the last good
+  line, and says so once in red. The backup is refreshed every five minutes
+  while the live file is healthy.
+- **Journal written to `journal-unknown.jsonl`** when the character name was
+  not yet available at load. The name is resolved lazily now, and anything
+  in the unknown file is folded into the named one once (the old file is
+  renamed, not deleted).
+
+## Build 3.4.0
+
+## New
+
+- **Itmejammy theme.** A light blue trim in place of the gold, on a cooler
+  base so the blue sits on the panel rather than floating above it. Named for
+  **Itmejammy**, for everything he has done for this community's addons - and
+  because he is the one who asked for it: *"like a light blue trim, instead of
+  gold"*.
+
+  Appearance tab, next to DarkGold. Every trim value is a tint of one hue
+  (#8FD8FF), and every text colour clears WCAG AA against the panel.
+
+  It takes the **whole** panel. The per-activity accents - amber for mining,
+  crimson for hunting and the rest - sat on top of every palette and were the
+  real reason the panel stayed gold whatever you picked; Itmejammy overrides
+  them and the Accent Color Per Activity toggle with them. Good / warn / bad
+  are re-tuned cool rather than flattened, because a caution that looks like
+  every other blue is not a caution.
+
+## Build 3.3.6
+
+## Fixed
+
+- **Every haul item was listed twice**, each copy marked as the best drop.
+  Nothing was double-counted - net gil and the fatigue count were always
+  right - the list was simply drawn twice on top of itself.
+
+  The haul draws into a child window and falls back to a plain list on ImGui
+  builds that have no child windows. That fallback was gated on a value
+  `libs/ui.lua` only started returning recently, so with an older `ui.lua`
+  underneath it read as "no child window" and drew the whole list a second
+  time. Mixing a new `tracker.lua` with an old `ui.lua` was enough to trigger
+  it - which patch updates made easy, and that is on me.
+
+  The fallback now tracks whether the rows actually reached the screen, so a
+  double draw is impossible whichever `ui.lua` is installed. **`libs/ui.lua`
+  is included in this update** so the two match.
+
+## Build 3.3.5
+
+## Fixed
+
+- **`/floos zones` lost the lifetime zone ranking.** 3.3.0 added a zone
+  fatigue list on the same command name and put it earlier in the handler, so
+  it shadowed the report that had been there all along - the ranked
+  "where have I actually earned" list never ran again.
+
+  Both now come from the one command, ranking first:
+
+      /floos zones      lifetime ranking, then today's fatigue counters
+      /floos zf         only the fatigue counters
+      /floos zones clear   wipes the lifetime ranking
+      /floos zf clear      wipes only the fatigue counters
+
+  The two clears are deliberately separate, and each says which one it kept.
+
+## Build 3.3.4
+
+- **A wipe now announces itself.** On load, if the settings file looks reset
+  and a healthy backup exists, Floos says so in red and tells you the two
+  commands to get your data back. Ashita's own revert notice scrolls past in
+  the load spam; a wipe found weeks later is a wipe that cannot be undone.
+
+  In that state Floos does **not** refresh the backup, so the good copy stays
+  good however many times you log in before you notice.
+
+## Build 3.3.3
+
+## Important - the 3.3.0 to 3.3.2 downloads were incomplete
+
+Those three zips were built as a whole addon folder, but the folder they were
+built from was missing twelve library files. Extracting them **on top of** an
+existing install was fine, because the missing files were already there. But
+anyone who deleted their old `floos` folder first - a perfectly normal way to
+update - ended up with a broken install.
+
+**Releases are patch-style from now on**: only the files that changed, to be
+extracted over an existing install. Nothing to delete first.
+
+## New
+
+- **`/floos backup` and `/floos restore`.** Ashita reverts settings to
+  defaults *and overwrites the file* whenever it fails to parse one, which
+  makes a single bad write the end of your lifetime totals, prices and zone
+  counters. There is no undo built in.
+
+  Floos now keeps `settings.bak.lua` beside the live file, refreshed on load -
+  but only when the live file looks healthy, so a wipe cannot propagate into
+  the backup on the next start. If the live file is dramatically smaller than
+  the backup, the backup is kept and Floos says so.
+
+      /floos backup       where the files are and how big
+      /floos backup now   write one immediately
+      /floos restore      put the backup back, then /addon reload floos
+
+  Restoring also keeps `settings.before-restore.lua`, so restoring is itself
+  undoable.
+
+## Build 3.3.2
+
+## New
+
+- **`/floos save`** — flush settings, sessions and the zone fatigue counters
+  to disk on demand. They are already written on a ten-second autosave and on
+  unload; this is for when you want to be certain the file is current, such as
+  just before replacing the addon's files.
+
+## A note on updating
+
+Your data is not in the addon folder. Sessions, prices, lifetime totals and
+the zone fatigue counters all live in your settings file:
+
+    Ashita\config\addons\floos\<Character>_<id>\settings.lua
+
+Updating replaces `.lua` files under `Ashita\addons\floos\`, which is a
+different folder entirely, so a normal update keeps everything. Nothing needs
+exporting or re-entering.
+
+## Build 3.3.1
+
+## Changed
+
+- **`/floos clear` now clears the zone fatigue counters too**, as does the
+  **Reset Session** button. They were the only persistent thing the command
+  left behind, which made "cleared" untrue.
+
+  Logging in with *reset on load* set still leaves them alone. That path runs
+  the same function, and wiping your zone allowances on every login would
+  destroy the one thing they exist to remember — so the clearing is opt-in and
+  only the explicit, user-initiated clears ask for it.
+
+## Build 3.3.0
+
+## New
+
+- **Zone-specific fatigue.** Horizon's HELM allowance is per zone: 50 of 200
+  in Palborough Mines stays 50 of 200 there however long you spend somewhere
+  else. The session counter could never say that, because a session follows
+  you across zones.
+
+  The Fatigue meter now reads the count for the zone you are standing in, and
+  remembers every zone across relogs. Mining, logging, harvesting and
+  excavation only — **digging is untouched**, since its allowance is a daily
+  one on a real-life clock.
+
+  A zone clears itself when the fatigue period elapses from its first item, or
+  the moment you gather there past the cap. `/floos zones` lists every zone
+  with something counted and marks the one you are in; `/floos zones clear`
+  wipes them. The toggle, a per-zone list and Clear buttons are in
+  **Config → Data**. On by default; the meter says which counter it is showing
+  by calling itself *Zone fatigue* rather than *Fatigue*.
+
+- **The rate history is a real chart.** The old sparkline was a decoration the
+  height of one row. It now holds 30 minutes instead of 8, with a gradient
+  under the curve, your session average drawn as a dashed line across it so
+  you can see at a glance whether the last few minutes are beating it, the
+  peak marked, and the newest reading pulsing at the right edge.
+
+- **Tiles instead of run-on lines.** The facts under the hero number — session
+  clock, moon, Vana'diel day and time, weather — were joined with pipes into
+  one line that clipped from the right, so the last one was the one you never
+  saw. Each is now its own tile with a small caps label over its value, and
+  each truncates on its own. The session tile is the pause button.
+
+  The footer got the same treatment: Net, Gil/hr, Last 10m and Lifetime read
+  side by side instead of as four stacked rows.
+
+## Changed
+
+- **The hero number glides** to its new value instead of snapping every time a
+  sample lands, the same easing net gil already had.
+
+- Compact and Mini modes are unchanged.
+
+# Floos 3.2.0
+
+All three of these come from Reisu's report on Discord.
+
+## New
+
+- **See what is in the bucket while you clam.** The panel used to show the
+  bucket's weight and its gil value, but never its contents — you could only
+  find out what you had been carrying after you turned it in. There is now an
+  **In bucket** list under the weight meter: every item, its count, and what
+  the stack is worth, sorted so the thing you would most regret losing to a
+  burst is at the top.
+
+  Items you have no price set for say `no price` rather than `0g`, because zero
+  reads as worthless when it actually means unknown.
+
+  Off by default — it costs a line per item type — under
+  **Clamming → Show Bucket Contents**, with a sub-option to drop the prices and
+  show plain counts.
+
+## Fixed
+
+- **The config window ignored your font settings.** You could scale the session
+  panel but not this window, and there was no hidden option to find: `floos.lua`
+  rendered the config *before* pushing the chosen font, so it always drew at
+  ImGui's default size and family. It now follows **Font Size** like everything
+  else, and there is a **Config Window** slider beside it (0.60–2.00) for
+  people who want this window a different size from the panels.
+
+- **The 24-hour reset countdown now only appears on Digging.** Chocobo digging
+  is the one activity with a real daily allowance on a real-life clock. The
+  others run on a rolling fatigue window with no fixed reset, so "next reset in
+  6h" on the Mining tab was inviting you to sit and wait for something that was
+  never going to happen.
+
+  The schedule also only *learns* from digging now. A cap clearing on the other
+  activities says nothing about when the daily clock rolls over, and feeding
+  those in was dragging the prediction around.
+
+# Floos 3.1.0
+
+## New
+
+- **Sound alerts.** Rank up, skill up, valuable drop, fatigue cap reached, and
+  clamming point ready. A new **Sound** tab in the config gives each event its
+  own dropdown, with a Play button to audition it.
+
+  No audio ships with Floos. Drop your own `.wav` files into `floos/sounds/`
+  and they appear in the list. Every event starts on **None**, so the addon is
+  silent until you choose. `/floos sound` shows what is set and what is
+  available; `/floos sound test <file>` plays one.
+
+- **Clamming cooldown ding.** Plays the moment the point is ready again. It
+  fires whatever tab you are on and whether or not the panel is showing,
+  because a timer you only hear while staring at it is not a timer.
+
+- **The panel hides behind the map and the main menu**, and comes straight back
+  when you close them. Covers the map, widescan, inventory, equipment, the
+  config screens and the rest of the full-screen windows - but deliberately not
+  the chat log, which opens every time you press Enter to talk. On by default;
+  turn it off in Interface, or with `/floos menu`.
+
+- **RANK UP! banner.** A centred, addon-themed banner for ten seconds when a
+  HELM rank increases - 10, 20, 30, 40, 50 and 60. `/floos rankup` previews it.
+
+- **Skill-up rate by moon phase.** New Moon / Full Moon / Normal, replacing the
+  old W/M/B row. **Off by default** - it needs hundreds of swings in each
+  bucket before the three numbers mean anything, so it is opt-in from
+  Interface -> Skillup Rate By Moon Phase.
+
+- **Dig accuracy tracker**, matching the one mining already had.
+
+## Fixed
+
+- **Banners no longer blink.** They vanished after a single frame roughly half
+  the time. The addon's millisecond clock was built from two unsynchronised
+  sources and could tick backwards; anything timed read a backwards tick as
+  "expired". The clock is monotonic now. This also affected the swing flash and
+  every other timed effect, so those are steadier too.
+
+- **Moon phases were misread.** A New Moon was being counted as Normal. The
+  phase boundaries are not symmetric - waxing and waning have different
+  windows - and only one set was being applied in both directions.
+
+- **Estimated dig items now appears immediately.** It stayed blank until you
+  had dug 25 times in the current session, which is exactly when you least
+  need it. It now prices your remaining greens against your lifetime accuracy
+  until the session has enough digs of its own, and says which rate it used.
+
+- **The rank banner runs for ten seconds**, up from five. Five was easy to miss.
+
+- **Fonts are genuinely loaded from Windows now.** The 1.0.0 notes said this
+  already, but the code still only looked inside the addon folder. It now
+  checks the Windows font directory first (via `%SystemRoot%`, not a hardcoded
+  `C:`), falls back to a local copy if one exists, and then to Agave. No
+  Microsoft fonts are bundled.
+
+---
+
 # Floos
 
 ## 1.0.0 - first release (formerly Olenna)

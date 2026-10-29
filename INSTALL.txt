@@ -1,0 +1,44 @@
+Floos 3.3.0
+===========
+
+A HELM companion for HorizonXI: Mining, Logging, Harvesting, Excavation,
+Hunting, Fishing, Chocobo Digging and Clamming.
+
+
+INSTALL
+
+  Extract the "floos" folder into:   Ashita\addons\
+  Overwrite when asked. You do not need to delete an older copy first.
+
+  Then, in game:   /addon load floos     (or /addon reload floos)
+
+  Start with:      /floos help
+
+
+YOUR DATA
+
+  Sessions, lifetime totals and zone history are NOT in this folder. They
+  live in:
+
+      Ashita\config\addons\floos\<Character>_<id>\settings.lua
+
+  Updating never touches them. Floos also keeps a backup of that file beside
+  it - see /floos backup and /floos restore.
+
+
+SOUNDS AND FONTS ARE NOT INCLUDED
+
+  sounds/ ships empty on purpose. Drop your own .wav files in and they become
+  selectable in the Sound tab. See sounds/README.txt for where to find a set.
+
+  The optional overlay fonts are Microsoft Windows fonts and are not ours to
+  redistribute. Floos uses Ashita's built-in font unless you supply your own;
+  see assets/fonts/README.txt.
+
+  Neither is required. Nothing in the addon fails to load without them.
+
+
+LICENCE
+
+  GPLv3 - see LICENSE. Floos contains code adapted from XIUI, HGather and
+  xitools; see THIRD_PARTY_NOTICES.md for what came from where.

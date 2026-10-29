@@ -122,6 +122,35 @@ function M.grad_rect(dl, x, y, w, h, c_left, c_right)
     end
 end
 
+--- Vertical gradient fill (top color -> bottom color). The area under a
+--- chart line wants this: solid at the line, gone by the floor.
+function M.vgrad_rect(dl, x, y, w, h, c_top, c_bottom)
+    if dl == nil or w == nil or w <= 0 or h == nil or h <= 0 then
+        return;
+    end
+    local t = M.u32(c_top);
+    local b = M.u32(c_bottom);
+    local ok = safe(function()
+        dl:AddRectFilledMultiColor({ x, y }, { x + w, y + h }, t, t, b, b);
+    end);
+    if not ok then
+        M.rect(dl, x, y, w, h, c_top, 0);
+    end
+end
+
+--- Dashed horizontal line. Reference lines on a chart should not be
+--- mistaken for the data, and a dash is the oldest way of saying so.
+function M.hdash(dl, x1, x2, y, color, dash, gap, thickness)
+    if dl == nil or x2 <= x1 then return; end
+    dash = dash or 5;
+    gap = gap or 4;
+    local x = x1;
+    while x < x2 do
+        M.line(dl, x, y, math.min(x + dash, x2), y, color, thickness or 1);
+        x = x + dash + gap;
+    end
+end
+
 --- Track + gradient fill meter.
 --- opts: { rounding, track, tick (0..1), tick_color, glow }
 function M.bar(dl, x, y, w, h, pct, c_from, c_to, opts)

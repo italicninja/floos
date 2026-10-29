@@ -8,6 +8,7 @@ local chat = require('chat');
 local imgui = require('imgui');
 local settings = require('settings');
 local theme = require('libs.theme');
+local portrait = require('libs.portrait');
 local ui = require('libs.ui');
 local fonts = require('libs.fonts');
 local attribution = require('libs.attribution');
@@ -22,7 +23,6 @@ M.default_settings = T{
     reset_on_load = T{ false },
     panels_hidden = T{ false },
     layout_version = T{ 170 },
-    psxi_token = T{ '' },   -- optional psxi.gg API token for /floos prices fetch
     lifetime = T{
         gil_gained = T{ 0 }, -- overall history; never cleared by session reset
         skill_w = T{ 0 },
@@ -62,57 +62,9 @@ M.default_settings = T{
         'rosewood log:500',
         'mahogany log:800',
         'fresh leaves:50',
-        -- Harvesting. Every item on the wiki's Harvesting category, keyed by
-        -- the name the chat log uses, which is what the tracker reads. Prices
-        -- are 0 until you fill them: /floos prices fetch pulls live ones.
-        'ball of saruta cotton:100',
+        'saruta cotton:100',
         'flax flower:150',
-        'clump of moko grass:80',
-        'clump of red moko grass:0',
-        'clump of beaugreens:0',
-        'clump of imperial tea leaves:0',
-        'clump of mohbwa grass:0',
-        'clump of windurstian tea leaves:0',
-        'clump of wolf fur:0',
-        'bag of coffee cherries:0',
-        'bag of grain seeds:0',
-        'bag of herb seeds:0',
-        'bag of simsim:0',
-        'bag of vegetable seeds:0',
-        "sprig of dyer's woad:0",
-        'sprig of fresh marjoram:0',
-        'sprig of fresh mugwort:0',
-        'sprig of mistletoe:0',
-        'sprig of sage:0',
-        'piece of crawler cocoon:0',
-        'piece of raw wool:0',
-        'pod of blue peas:0',
-        'pot of honey:0',
-        'jar of toad oil:0',
-        'spool of malboro fiber:0',
-        'beehive chip:0',
-        'pephredo hive chip:0',
-        'cattleya:0',
-        'phalaenopsis:0',
-        'wijnruit:0',
-        'eastern ginger root:0',
-        'eggplant:0',
-        'frost turnip:0',
-        'popoto:0',
-        'wild onion:0',
-        'insect wing:0',
-        'king locust:0',
-        'mushroom locust:0',
-        'skull locust:0',
-        'spider web:0',
-        'coral fungus:0',
-        'scream fungus:0',
-        'sobbing fungus:0',
-        'danceshroom:0',
-        'sleepshroom:0',
-        'woozyshroom:0',
-        'puffball:0',
-        'reishi mushroom:0',
+        'moko grass:80',
         -- Clamming (Bibiki Bay). Rough Horizon values; edit to taste.
         'piece of oxblood:13250',
         'tropical clam:5100',
@@ -192,6 +144,12 @@ M.default_settings = T{
         kit_subtract = T{ true },
         hq_body = T{ false },      -- HQ swimwear halves the 200pz incident rate
         dig_delay = T{ 10 },       -- per-point cooldown, measured from the find
+        -- List what is actually in the bucket, not just its weight. Off by
+        -- default because it grows the panel by a line per item type; on if
+        -- you price your own haul and want to see it before turning in.
+        show_bucket = T{ false },
+        -- Unit price beside each bucket line. Only useful with the above.
+        bucket_prices = T{ true },
     },
     --- Which activity tabs appear on the panel. Eight will not fit a 340px
     --- window; switching one off only hides the tab, it keeps tracking.
@@ -209,6 +167,22 @@ M.default_settings = T{
         observations = T{},        -- epochs of resets we actually witnessed
         period_hours = T{ 24 },
         last_seen = T{ 0 },
+        -- Count fatigue per zone (mining, logging, harvesting, excavation)
+        -- instead of per session. On: the per-zone number is the one that
+        -- matches what the server is actually doing.
+        per_zone = T{ true },
+        -- The per-zone counters themselves. Written by the tracker.
+        zones = T{},
+        -- The global counter: climbs in its home zone, and every hit in
+        -- any other zone takes one off. On by default - it is the thing
+        -- Tyflow asked Floos for, so it should be on the panel without a
+        -- trip through the commands. /floos global off puts it away.
+        global_on = T{ true },
+        -- Whether /floos clear is allowed to wipe it. On by default: a
+        -- counter that exists to be watched across zones is worthless if
+        -- clearing a session takes it with it.
+        global_protect = T{ true },
+        global = T{},
     },
     journal = T{
         enabled = T{ true },
@@ -227,6 +201,14 @@ M.default_settings = T{
     },
     tracker = T{
         visible = T{ true },
+        -- Follow the activity you are doing: mine then dig and the panel
+        -- moves to the Dig tab by itself.
+        auto_switch_tab = T{ true },
+        -- Un-hide the panel when an activity starts. Asked for by Babs, who
+        -- keeps it hidden on purpose and does not want it appearing over the
+        -- game every time they swing. On by default - that is how Floos has
+        -- always behaved - but it is a choice now.
+        auto_show = T{ true },
         x = T{ 120 },
         y = T{ 120 },
         width = T{ 340 },
@@ -237,18 +219,55 @@ M.default_settings = T{
         show_controls = T{ false },
         show_moon = T{ true },
         show_fatigue = T{ true },
+        show_accuracy = T{ false },   -- Accuracy row under Zone fatigue
         show_zone_verdict = T{ true },
         verdict_metric = T{ 'Gil' },   -- Gil | Skill
         show_best_for = T{ true },
     },
+    -- Sound alerts. Empty filenames mean that event stays silent, which is
+    -- the default for all of them: the addon ships no audio, so anything set
+    -- here would point at a file that is not there.
+    sounds = T{
+        enabled = T{ true },
+        rank_up = T{ '' },
+        skill_up = T{ '' },
+        big_drop = T{ '' },
+        big_drop_gil = T{ 3000 },
+        fatigue_cap = T{ '' },
+        clam_ready = T{ '' },
+    },
     ui = T{
         background_theme = T{ 'DarkGold' },
+        -- A faded picture behind the panel. Empty by default; drop a PNG in
+        -- assets/portraits/ and pick it in Appearance. Nothing ships here -
+        -- see that folder's README for why.
+        bg_image = T{ '' },
+        bg_image_alpha = T{ 0.12 },
+        -- Image width as a multiple of panel height. The texture manager
+        -- does not report image dimensions, so this cannot be worked out -
+        -- it has to be told. 0.671 is the reference portrait's true ratio.
+        bg_image_width = T{ 0.671 },
+        -- Which theme put the current picture there, or '' if the player
+        -- chose it themselves. See apply_theme_portrait.
+        bg_image_owner = T{ '' },
         font_family = T{ 'Tahoma Bold (Default)' },
         accent_by_activity = T{ true },
         text_style = T{ 'Shadow' },
         show_bars = T{ true },
+        -- The config window used to draw at ImGui's default size no matter
+        -- what Font Size said, because it is rendered before the font push.
+        -- It now follows Font Size like everything else, and this multiplies
+        -- on top for people who want it bigger or smaller than the panels.
+        config_scale = T{ 1.0 },
         show_strip = T{ true },
         show_sparkline = T{ true },
+        -- Skill-up rate split by moon phase. Off by default: it needs
+        -- hundreds of swings per bucket before it says anything.
+        show_moon_rates = T{ false },
+        -- The centred RANK UP! banner. Six times in a career to 60.
+        rank_toast = T{ true },
+        -- Step aside while the map or the main menu is open, come back after.
+        hide_on_menu = T{ true },
         animations = T{ true },
         expert = T{ true },     -- labeled rules, 10m trend, meter graduations
         detail = T{ 'Full' },   -- Full | Compact | Mini
@@ -315,7 +334,124 @@ local function fill_height(min_h)
     return h;
 end
 
+--- Move the background picture along with the theme.
+---
+--- A tribute theme is a package - the colours AND the picture - so picking it
+--- should be one click, not a theme followed by a hunt through the Background
+--- Picture combo. The whole difficulty is doing that without ever throwing
+--- away a picture the player chose for themselves.
+---
+--- So ownership is tracked. bg_image_owner holds the id of the theme that put
+--- the current picture there, or '' when the player picked it. This function
+--- only ever touches a picture it owns:
+---
+---   no picture at all      -> the new theme may set one
+---   picture owned by the   -> replaced by the new theme's, or cleared
+---     theme being left        if the new theme has none
+---   picture owned by the   -> left completely alone, forever
+---     player
+---
+--- Which means: pick Beasty and his portrait appears. Switch to Itmejammy and
+--- it goes, because it came with the theme. But drop your own screenshot in
+--- and choose it, and no theme switch will ever disturb it again.
+---
+--- CHOOSING "NONE" IS ALSO A CHOICE
+--- --------------------------------
+--- The subtle case, and the one worth getting right: somebody on Beasty who
+--- sets the picture to None. That leaves no picture to own, so a naive
+--- version reads it as "nothing set yet" and puts the portrait straight back
+--- on the next load - which is the addon overruling the player, every single
+--- session. So a refusal is recorded as 'none:<theme>' and honoured for that
+--- theme. Deliberately switching to a different theme offers its package
+--- again, because that is a fresh decision; reloading does not.
+---
+--- The file is only set if it actually exists in assets/portraits. Character
+--- art is not redistributable so it is not shipped, and a theme naming a file
+--- nobody has must be a no-op rather than a broken-looking setting.
+---@param prev_id string|nil  theme being left, nil on first load
+---@param new_id  string|nil  theme being taken up
+function M.apply_theme_portrait(prev_id, new_id)
+    local uiset = M.settings ~= nil and M.settings.ui or nil;
+    if uiset == nil or uiset.bg_image == nil then return; end
+    if uiset.bg_image_owner == nil then uiset.bg_image_owner = T{ '' }; end
+
+    local cur   = tostring(uiset.bg_image[1] or '');
+    local owner = tostring(uiset.bg_image_owner[1] or '');
+
+    -- The player's own picture outranks every theme. Bail before anything
+    -- else so there is no path through here that can lose it.
+    if cur ~= '' and owner == '' then return; end
+    -- Owned by some other theme than the one being left: also not ours.
+    if cur ~= '' and prev_id ~= nil and owner ~= tostring(prev_id) then return; end
+    -- A recorded refusal, still on the theme it was made for: honour it.
+    local refused = owner:match('^none:(.*)$');
+    if cur == '' and refused ~= nil then
+        if refused == tostring(new_id or '') then return; end
+        -- Refused under a different theme. Picking a new one is a fresh
+        -- decision, so the old refusal is spent and its package may be
+        -- offered again. Without this the refusal is permanent and "choose
+        -- Beasty, get the package" quietly stops working forever for anyone
+        -- who ever pressed None.
+        owner = '';
+        uiset.bg_image_owner[1] = '';
+    end
+
+    local name, alpha, width = theme.portrait_for(new_id);
+    if name ~= nil then
+        local present = false;
+        for _, f in ipairs(portrait.list()) do
+            if tostring(f):lower() == tostring(name):lower() then
+                name = f;          -- take the file's real casing
+                present = true;
+                break;
+            end
+        end
+        if present then
+            uiset.bg_image[1] = name;
+            uiset.bg_image_owner[1] = tostring(new_id);
+            if uiset.bg_image_alpha ~= nil and alpha ~= nil then
+                uiset.bg_image_alpha[1] = alpha;
+            end
+            if uiset.bg_image_width ~= nil and width ~= nil then
+                uiset.bg_image_width[1] = width;
+            end
+            return;
+        end
+    end
+
+    -- New theme carries no picture, or its file is not installed. Clear the
+    -- outgoing theme's picture so it does not linger under the wrong colours.
+    if cur ~= '' and owner ~= '' then
+        uiset.bg_image[1] = '';
+        uiset.bg_image_owner[1] = '';
+    end
+end
+
 function M.ensure_ui_settings()
+    -- Ashita's settings.load does not merge, so a file written by an older
+    -- Floos simply lacks these keys. The guards in tracker.lua already treat
+    -- a missing key as "on", so behaviour is unchanged either way - this is
+    -- what makes them appear in the config window.
+    if M.settings.ui ~= nil then
+        if M.settings.ui.bg_image == nil then M.settings.ui.bg_image = T{ '' }; end
+        if M.settings.ui.bg_image_alpha == nil then
+            M.settings.ui.bg_image_alpha = T{ 0.12 };
+        end
+        if M.settings.ui.bg_image_width == nil then
+            M.settings.ui.bg_image_width = T{ 0.671 };
+        end
+        if M.settings.ui.bg_image_owner == nil then
+            M.settings.ui.bg_image_owner = T{ '' };
+        end
+    end
+    if M.settings.tracker ~= nil then
+        if M.settings.tracker.auto_switch_tab == nil then
+            M.settings.tracker.auto_switch_tab = T{ true };
+        end
+        if M.settings.tracker.auto_show == nil then
+            M.settings.tracker.auto_show = T{ true };
+        end
+    end
     if M.settings.font_size == nil then
         M.settings.font_size = T{ 13 };
     end
@@ -339,6 +475,24 @@ function M.ensure_ui_settings()
         or M.settings.ui.background_theme[1] == '' then
         M.settings.ui.background_theme = T{ 'DarkGold' };
     end
+    -- A palette that has been renamed would otherwise silently revert to
+    -- DarkGold, because the settings file stores the id and not the label.
+    -- Runs after the normalisation above so it is looking at a real id.
+    do
+        local was = tostring(M.settings.ui.background_theme[1] or '');
+        local now = theme.canonical_theme(was);
+        if now ~= nil and now ~= was then
+            M.settings.ui.background_theme[1] = now;
+            if M.settings.ui.bg_image_owner ~= nil
+                and tostring(M.settings.ui.bg_image_owner[1] or '') == was then
+                M.settings.ui.bg_image_owner[1] = now;
+            end
+        end
+    end
+    -- Somebody already sitting on a theme that carries a picture, from before
+    -- themes carried pictures, should get it on the next load rather than
+    -- having to switch away and back to trigger it.
+    M.apply_theme_portrait(nil, M.settings.ui.background_theme[1]);
     -- Presentation flags added in 1.7.0.
     local function ensure_flag(tbl, key, value)
         if tbl[key] == nil then
@@ -349,9 +503,43 @@ function M.ensure_ui_settings()
     ensure_flag(M.settings.ui, 'accent_by_activity', true);
     ensure_flag(M.settings.ui, 'text_style', 'Shadow');
     ensure_flag(M.settings.ui, 'show_bars', true);
+    if M.settings.ui.config_scale == nil then
+        M.settings.ui.config_scale = T{ 1.0 };
+    end
     ensure_flag(M.settings.ui, 'show_strip', true);
     ensure_flag(M.settings.ui, 'show_sparkline', true);
+    ensure_flag(M.settings.ui, 'show_moon_rates', false);
+    ensure_flag(M.settings.ui, 'rank_toast', true);
+    ensure_flag(M.settings.ui, 'hide_on_menu', true);
+    -- Sound alerts, added later than the rest, so an existing settings file
+    -- will not have the group at all.
+    if M.settings.sounds == nil then
+        M.settings.sounds = T{};
+    end
+    ensure_flag(M.settings.sounds, 'enabled', true);
+    ensure_flag(M.settings.sounds, 'rank_up', '');
+    ensure_flag(M.settings.sounds, 'skill_up', '');
+    ensure_flag(M.settings.sounds, 'big_drop', '');
+    ensure_flag(M.settings.sounds, 'big_drop_gil', 3000);
+    ensure_flag(M.settings.sounds, 'fatigue_cap', '');
+    ensure_flag(M.settings.sounds, 'clam_ready', '');
     ensure_flag(M.settings.ui, 'animations', true);
+
+    -- Names the player taught it with /floos menu add, for any menu the
+    -- built-in list does not know about. Plain lists, not T{ value } flags.
+    if M.settings.ui.menu_extra == nil then
+        M.settings.ui.menu_extra = T{};
+    end
+    -- Built-ins the player took back out, e.g. one that turns out to fire on
+    -- something ordinary. Wins over the built-in list.
+    if M.settings.ui.menu_never == nil then
+        M.settings.ui.menu_never = T{};
+    end
+    pcall(function ()
+        local menu = require('libs.menu');
+        menu.set_extra(M.settings.ui.menu_extra);
+        menu.set_never(M.settings.ui.menu_never);
+    end);
     ensure_flag(M.settings.ui, 'expert', true);
     ensure_flag(M.settings.ui, 'compact', false);
 
@@ -417,6 +605,9 @@ function M.ensure_ui_settings()
     if M.settings.tracker.show_fatigue == nil then
         M.settings.tracker.show_fatigue = T{ true };
     end
+    if M.settings.tracker.show_accuracy == nil then
+        M.settings.tracker.show_accuracy = T{ false };
+    end
     if M.settings.tracker.show_zone_verdict == nil then
         M.settings.tracker.show_zone_verdict = T{ true };
     end
@@ -435,6 +626,22 @@ function M.ensure_ui_settings()
     if (tonumber(M.settings.fatigue.period_hours[1]) or 0) <= 0 then
         M.settings.fatigue.period_hours[1] = 24;
     end
+    if M.settings.fatigue.per_zone == nil then
+        M.settings.fatigue.per_zone = T{ true };
+    end
+    if M.settings.fatigue.zones == nil then
+        M.settings.fatigue.zones = T{};
+    end
+    if M.settings.fatigue.global_on == nil then M.settings.fatigue.global_on = T{ true }; end
+    -- A file written by an early 3.8.0 build carries global_on = false from
+    -- the days it was off by default. Switch it on once, and remember that
+    -- it was done so a deliberate /floos global off is respected after.
+    if M.settings.fatigue.global_seeded == nil then
+        M.settings.fatigue.global_seeded = T{ true };
+        M.settings.fatigue.global_on[1] = true;
+    end
+    if M.settings.fatigue.global_protect == nil then M.settings.fatigue.global_protect = T{ true }; end
+    if M.settings.fatigue.global == nil then M.settings.fatigue.global = T{}; end
     if M.settings.fatigue.last_seen == nil then
         M.settings.fatigue.last_seen = T{ 0 };
     end
@@ -522,6 +729,7 @@ function M.ensure_ui_settings()
         { 'digging', 'ore_watch', true },
         { 'clamming', 'idle_grace', 15 }, { 'clamming', 'kit_cost', 500 },
         { 'clamming', 'kit_subtract', true }, { 'clamming', 'hq_body', false },
+        { 'clamming', 'show_bucket', false }, { 'clamming', 'bucket_prices', true },
         { 'clamming', 'dig_delay', 10 },
         { 'tabs', 'mining', true },   { 'tabs', 'logging', true },
         { 'tabs', 'harvest', true },  { 'tabs', 'excavate', true },
@@ -565,9 +773,6 @@ function M.ensure_ui_settings()
     end
     if M.settings.item_index == nil then
         M.settings.item_index = M.default_settings.item_index:copy();
-    end
-    if M.settings.psxi_token == nil then
-        M.settings.psxi_token = T{ '' };
     end
 end
 
@@ -632,106 +837,6 @@ function M.merge_prices(lines)
     return updated, added, skipped;
 end
 
---- Pull live market prices from psxi.gg and merge them into the price list.
----
---- The keyless snapshot endpoint returns every scanned item on the server, so
---- there is nothing to look up by hand: one request, then only the names
---- already in the price list are updated. Nothing new is ever added - a 4000
---- item price list would be unreadable, and the point is to price what you
---- actually gather.
----
---- psxi names items the way the auction house does ("Moko Grass"); the price
---- list is keyed by the name the chat log uses ("clump of moko grass"), so
---- each row is offered under both, resolved through Ashita's item resources.
----
---- This blocks until the request finishes, which is a second or two on a 2MB
---- body. It is a typed command, not a frame hook, so a brief hitch is the
---- honest trade against a threading layer.
---- ponytail: synchronous fetch on the render thread; move to a coroutine only
---- if this ever runs on a timer instead of on demand.
-local PSXI_URL = 'https://www.psxi.gg/api/v1/market/horizonxi';
-
-function M.fetch_prices(token)
-    local ok_https, https = pcall(require, 'socket.ssl.https');
-    local ok_ltn12, ltn12 = pcall(require, 'socket.ltn12');
-    local ok_json, json = pcall(require, 'json');
-    if not (ok_https and ok_ltn12 and ok_json) then
-        return nil, "LuaSocket/LuaSec is missing from Ashita's addons/libs.";
-    end
-
-    local headers = { ['accept'] = 'application/json' };
-    if token ~= nil and token ~= '' then
-        headers['authorization'] = 'Bearer ' .. token;
-    end
-
-    local body = {};
-    local _, code = https.request({
-        url = PSXI_URL,
-        headers = headers,
-        sink = ltn12.sink.table(body),
-    });
-    if code ~= 200 then
-        return nil, string.format('psxi.gg returned %s.', tostring(code));
-    end
-
-    local ok, doc = pcall(json.decode, table.concat(body));
-    if not ok or type(doc) ~= 'table' or type(doc.data) ~= 'table' then
-        return nil, 'psxi.gg sent something this cannot read.';
-    end
-
-    -- Only names already on the list are worth resolving.
-    local want = {};
-    for _, line in ipairs(M.settings.item_index) do
-        local name = split(line, ':')[1];
-        if name ~= nil then
-            want[string.lower(name:match('^%s*(.-)%s*$') or '')] = true;
-        end
-    end
-
-    local res = nil;
-    pcall(function () res = AshitaCore:GetResourceManager(); end);
-
-    local lines = {};
-    for _, row in ipairs(doc.data) do
-        local price = nil;
-        if type(row.ah) == 'table' and type(row.ah.single) == 'table' then
-            -- 7-day mean of single-item sales, which is what a session of
-            -- gathering actually clears; lastSale is one data point and the
-            -- bazaar is asking prices, so both are only fallbacks.
-            price = row.ah.single.avg or row.ah.single.lastSale;
-        end
-        if price == nil and type(row.bazaar) == 'table' then
-            price = row.bazaar.avg;
-        end
-        if type(price) == 'number' and price > 0 then
-            local names = { row.itemName };
-            if res ~= nil and row.itemId ~= nil then
-                pcall(function ()
-                    local item = res:GetItemById(row.itemId);
-                    if item ~= nil and item.LogNameSingular ~= nil then
-                        for _, lang in ipairs({ 1, 2, 0 }) do
-                            local log = item.LogNameSingular[lang];
-                            if type(log) == 'string' and log ~= '' then
-                                names[#names + 1] = log;
-                                break;
-                            end
-                        end
-                    end
-                end);
-            end
-            for _, name in ipairs(names) do
-                if type(name) == 'string' and want[string.lower(name)] then
-                    lines[#lines + 1] = string.format('%s:%d', name,
-                        math.floor(price + 0.5));
-                end
-            end
-        end
-    end
-
-    local updated = M.merge_prices(lines);
-    return updated, doc.meta and doc.meta.generatedAt or nil;
-end
-
 --- Where the import looks when given a bare filename.
 function M.prices_dir()
     local ok, p = pcall(function ()
@@ -752,7 +857,7 @@ local function render_general()
     ui.end_child();
 
     imgui.Text('Fonts');
-    ui.begin_child('floos_fonts', { 0, 100 }, true);
+    ui.begin_child('floos_fonts', { 0, 150 }, true);
     if imgui.InputInt('Font Size', M.settings.font_size) then
         if M.settings.font_size[1] < 6 then M.settings.font_size[1] = 6; end
         if M.settings.font_size[1] > 30 then M.settings.font_size[1] = 30; end
@@ -761,6 +866,12 @@ local function render_general()
         M.settings.ui.font_family = T{ 'Tahoma Bold (Default)' };
     end
     fonts.render_combo(M.settings.ui.font_family);
+
+    if M.settings.ui.config_scale == nil then
+        M.settings.ui.config_scale = T{ 1.0 };
+    end
+    imgui.SliderFloat('Config Window', M.settings.ui.config_scale, 0.60, 2.00, '%.2f');
+    imgui.TextDisabled('This window only. Font Size above drives everything.');
     ui.end_child();
 end
 
@@ -802,6 +913,9 @@ local function render_appearance()
     for _, entry in ipairs(themes) do
         if imgui.RadioButton(entry.label, current_theme == entry.id) then
             M.settings.ui.background_theme[1] = entry.id;
+            -- A theme can bring a picture with it, so switching theme has
+            -- to move the picture too.
+            M.apply_theme_portrait(current_theme, entry.id);
         end
         imgui.SameLine();
     end
@@ -820,9 +934,67 @@ local function render_appearance()
     imgui.Separator();
     imgui.Text('Display');
     imgui.Checkbox('Accent Color Per Activity', M.settings.ui.accent_by_activity);
+    -- A palette can claim the whole panel, in which case this control has
+    -- nothing left to do and should say so rather than looking broken.
+    -- Named the active palette rather than hardcoding one: this hint said
+    -- "Itmejammy" regardless of which whole-panel theme was on, which is
+    -- wrong the moment there is more than one of them.
+    if theme.active ~= nil and theme.active.force_accent then
+        imgui.TextDisabled(string.format(
+            '%s uses one colour everywhere, so this has no effect.',
+            tostring(theme.active_label or theme.active_name or 'This theme')));
+    end
+    -- The faded picture behind the panel. Sits with the other appearance
+    -- controls rather than in its own tab: it is a background, same as the
+    -- panel style above it.
+    do
+        local files = portrait.list();
+        local cur = tostring(M.settings.ui.bg_image[1] or '');
+        local label = (cur == '') and 'None' or cur;
+        imgui.SetNextItemWidth(200);
+        if imgui.BeginCombo('Background Picture', label) then
+            -- Anything chosen here is the player's own choice, so it is
+            -- marked as theirs and a later theme switch will leave it alone.
+            -- That includes picking None: somebody who turned the theme's
+            -- picture off meant it, and it must not come back.
+            if imgui.Selectable('None', cur == '') then
+                M.settings.ui.bg_image[1] = '';
+                M.settings.ui.bg_image_owner[1] = 'none:'
+                    .. tostring(M.settings.ui.background_theme[1] or '');
+            end
+            for _, f in ipairs(files) do
+                if imgui.Selectable(f, cur == f) then
+                    M.settings.ui.bg_image[1] = f;
+                    M.settings.ui.bg_image_owner[1] = '';
+                end
+            end
+            imgui.EndCombo();
+        end
+        imgui.SameLine();
+        if imgui.SmallButton('Rescan##portraits') then portrait.rescan(); end
+        if cur ~= '' then
+            imgui.SetNextItemWidth(200);
+            imgui.SliderFloat('Picture Fade', M.settings.ui.bg_image_alpha,
+                0.02, portrait.MAX_ALPHA, '%.2f');
+            imgui.TextDisabled('Capped on purpose - past this the numbers stop being readable.');
+            imgui.SetNextItemWidth(200);
+            imgui.SliderFloat('Picture Width', M.settings.ui.bg_image_width,
+                portrait.MIN_RATIO, portrait.MAX_RATIO, '%.2f');
+            imgui.TextDisabled('Ashita cannot tell an addon how big an image is, so this\nhas to be set by hand. Use the picture\'s width divided by\nits height - a 687x1024 portrait is 0.67 - and it will\nkeep its proportions at any panel size.');
+        elseif #files == 0 then
+            imgui.TextDisabled('Drop a PNG in assets/portraits/ and press Rescan.');
+        end
+    end
+
     imgui.Checkbox('Progress Bars', M.settings.ui.show_bars);
     imgui.Checkbox('Swing History Strip', M.settings.ui.show_strip);
     imgui.Checkbox('Rate Sparkline', M.settings.ui.show_sparkline);
+    imgui.Checkbox('Skillup Rate By Moon Phase', M.settings.ui.show_moon_rates);
+    imgui.TextDisabled('Off by default. Splits your lifetime skill-up rate into\nNew / Full / Normal moon. Needs hundreds of swings per\nbucket before the numbers mean anything.');
+    imgui.Checkbox('Rank-up Banner', M.settings.ui.rank_toast);
+    imgui.TextDisabled('Centred RANK UP! banner for five seconds.');
+    imgui.Checkbox('Hide Behind Map / Main Menu', M.settings.ui.hide_on_menu);
+    imgui.TextDisabled('Panel steps aside while a full-screen game menu is open\nand comes back when you close it.');
     imgui.Checkbox('Animations (flash / count-up)', M.settings.ui.animations);
     imgui.Checkbox('Expert visuals', M.settings.ui.expert);
     imgui.TextDisabled('Labeled section rules, last-10m rate trend, meter graduations.');
@@ -864,6 +1036,7 @@ local function render_appearance()
     ms.show_controls[1] = false;
 
     imgui.Checkbox('Show Fatigue', M.settings.tracker.show_fatigue);
+    imgui.Checkbox('Show Accuracy (under Zone fatigue)', M.settings.tracker.show_accuracy);
     imgui.Checkbox('Show Moon Phase', M.settings.tracker.show_moon);
     imgui.Checkbox('Show Skill Line', M.settings.mining.skillup_display);
     ui.end_child();
@@ -956,6 +1129,14 @@ local function render_mining()
     imgui.Checkbox('Subtract Kit Cost', M.settings.clamming.kit_subtract);
     imgui.TextDisabled('500g per kit from Toh Zonikki - your first one is free.');
     imgui.Checkbox('HQ Swimwear Body', M.settings.clamming.hq_body);
+
+    imgui.Checkbox('Show Bucket Contents', M.settings.clamming.show_bucket);
+    imgui.TextDisabled('Lists what is in the bucket while you dig, not just the weight.');
+    if M.settings.clamming.show_bucket[1] then
+        imgui.Indent(16);
+        imgui.Checkbox('With Unit Prices', M.settings.clamming.bucket_prices);
+        imgui.Unindent(16);
+    end
     imgui.TextDisabled('The HQ body piece halves the chance of something jumping');
     imgui.TextDisabled('into a 200pz bucket, 10 percent down to 5. It changes the');
     imgui.TextDisabled('risk figure on the Clam tab, nothing else.');
@@ -974,57 +1155,18 @@ local function render_mining()
     imgui.Text('Display');
     imgui.InputInt('Display Timeout (sec)', M.settings.tracker.display_timeout);
     imgui.Checkbox('Never Hide', M.settings.tracker.never_hide);
-    ui.end_child();
 
-    imgui.Text('psxi.gg Prices');
-    if M.settings.psxi_token == nil then
-        M.settings.psxi_token = T{ '' };
+    imgui.Checkbox('Follow the activity (switch tabs automatically)',
+        M.settings.tracker.auto_switch_tab);
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Mine, then dig, and the panel moves to the Dig tab by itself.');
     end
-    imgui.InputText('API Token', M.settings.psxi_token, 72);
-    imgui.TextDisabled('Optional today, required from 2026-11-01. Generate one at');
-    imgui.TextDisabled('psxi.gg - Settings - Account - API Access.');
-    if imgui.Button('Fetch Prices Now') then
-        -- Blocks for a second or two on a 2MB snapshot. Same call the
-        -- /floos prices fetch command makes.
-        local updated, info = M.fetch_prices(M.settings.psxi_token[1]);
-        if updated == nil then
-            M.psxi_status = tostring(info);
-        else
-            M.psxi_status = string.format('%d prices updated (snapshot %s).',
-                updated, tostring(info));
-        end
-        settings.save();
+    imgui.Checkbox('Show the panel when an activity starts',
+        M.settings.tracker.auto_show);
+    if imgui.IsItemHovered() then
+        imgui.SetTooltip('Off keeps a hidden panel hidden. It still tracks - use /floos show to look.');
     end
-    imgui.SameLine();
-    -- The default list grows with every wiki pass; a settings file saved
-    -- before that keeps the old, shorter one forever. This is how you take
-    -- the new list without deleting the rest of your settings. Prices you
-    -- already entered for an item on the default list are carried over -
-    -- the names are replaced, the work is not.
-    if imgui.Button('Restore Default List') then
-        local kept = {};
-        for _, line in ipairs(M.settings.item_index) do
-            local name, price = line:match('^%s*(.-)%s*:%s*(-?%d+)%s*$');
-            if name ~= nil and tonumber(price) ~= nil and tonumber(price) > 0 then
-                kept[string.lower(name)] = tonumber(price);
-            end
-        end
-        local rebuilt = T{};
-        for _, line in ipairs(M.default_settings.item_index) do
-            local name = split(line, ':')[1];
-            local price = kept[string.lower(name or '')];
-            rebuilt[#rebuilt + 1] = price ~= nil
-                and string.format('%s:%d', name, price) or line;
-        end
-        M.settings.item_index = rebuilt;
-        M.update_pricing();
-        settings.save();
-        M.psxi_status = string.format('%d default items restored.',
-            #M.settings.item_index);
-    end
-    if M.psxi_status ~= nil then
-        imgui.TextDisabled(M.psxi_status);
-    end
+    ui.end_child();
 
     imgui.Text('Item Prices (name:price, one per line)');
     local temp = T{ table.concat(M.settings.item_index, '\n') };
@@ -1040,9 +1182,14 @@ local function render_data()
 
     ui.begin_child('floos_data_cfg', { 0, fill_height(320) }, true);
 
-    imgui.Text('Fatigue reset schedule');
+    imgui.Text('Digging reset schedule');
+    imgui.TextDisabled('Chocobo digging is the only activity with a real daily');
+    imgui.TextDisabled('allowance on a real-life clock, so the countdown shows on');
+    imgui.TextDisabled('the Digging tab and nowhere else. The rest run on a rolling');
+    imgui.TextDisabled('window with no fixed reset to count down to.');
+    imgui.Spacing();
     imgui.TextDisabled('Learned by watching for the one thing that proves a reset:');
-    imgui.TextDisabled('being at the cap, then gathering successfully anyway.');
+    imgui.TextDisabled('being at the cap, then digging successfully anyway.');
     imgui.TextDisabled('This only predicts the next reset - it never clears your');
     imgui.TextDisabled('counters. Use /floos clear for that.');
     imgui.Spacing();
@@ -1083,6 +1230,124 @@ local function render_data()
     if imgui.Button('Forget schedule') then
         M.settings.fatigue.observations = T{};
     end
+
+    imgui.Spacing();
+    imgui.Separator();
+    imgui.Text('Zone-specific fatigue');
+    imgui.TextDisabled('Horizon\'s HELM allowance is per zone: 50 of 200 in Palborough');
+    imgui.TextDisabled('stays 50 of 200 there however long you spend elsewhere.');
+    imgui.TextDisabled('On, the Fatigue meter shows the count for the zone you are in,');
+    imgui.TextDisabled('and remembers every zone across relogs. Mining, logging,');
+    imgui.TextDisabled('harvesting and excavation only - digging is not touched.');
+    imgui.Spacing();
+    if imgui.Checkbox('Count fatigue per zone', M.settings.fatigue.per_zone) then
+        settings.save();
+    end
+    imgui.SameLine();
+    if M.settings.fatigue.per_zone[1] then
+        imgui.TextColored({ 0.53, 0.82, 0.47, 1.0 }, 'ON - meter reads "Zone fatigue"');
+    else
+        imgui.TextColored({ 0.60, 0.58, 0.54, 1.0 }, 'off - meter reads "Fatigue" (session)');
+    end
+
+    if M.settings.fatigue.per_zone[1] then
+        imgui.TextDisabled(string.format(
+            'A zone clears itself %d hours after its first item, or the moment',
+            tonumber(M.settings.fatigue.period_hours[1]) or 24));
+        imgui.TextDisabled('you gather there past the cap. The period is the one above.');
+        imgui.TextDisabled('/floos clear and Reset Session clear them all as well.');
+        imgui.Spacing();
+
+        local rows = tracker.zone_fatigue_rows();
+        if #rows == 0 then
+            imgui.TextDisabled('No zone has anything counted yet.');
+        else
+            local fmt = require('libs.format');
+            local act_label = { mining = 'Mine', logging = 'Log', harvest = 'Harvest', excavate = 'Excav' };
+            for i, r in ipairs(rows) do
+                local cap = tracker.fatigue_cap_for and tracker.fatigue_cap_for(r.act) or nil;
+                local count = cap and string.format('%d / %d', r.items or 0, cap)
+                    or tostring(r.items or 0);
+                local left = tracker.zone_fatigue_left(r);
+                local when = left and (' - clears in ' .. fmt.format_duration(left)) or '';
+                imgui.Text(string.format('%-8s %-26s %s%s',
+                    act_label[r.act] or r.act, tostring(r.name), count, when));
+                imgui.SameLine();
+                if imgui.SmallButton('Clear##zf' .. i) then
+                    tracker.zone_fatigue_clear(r.act, r.id);
+                    settings.save();
+                end
+            end
+            imgui.Spacing();
+            if imgui.Button('Clear every zone') then
+                tracker.zone_fatigue_clear_all();
+                settings.save();
+                print(chat.header(addon.name):append(chat.message('Zone fatigue counters cleared.')));
+            end
+        end
+    end
+
+    imgui.Separator();
+    imgui.Text('Global fatigue');
+    imgui.TextDisabled('One counter per activity that follows you between zones. It climbs');
+    imgui.TextDisabled('in the zone you are working - its home - and every hit in any other');
+    imgui.TextDisabled('zone takes one off. Drawn above Zone fatigue. Also: /floos global');
+    imgui.Spacing();
+    if imgui.Checkbox('Global fatigue counter', M.settings.fatigue.global_on) then
+        settings.save();
+    end
+    imgui.SameLine();
+    if M.settings.fatigue.global_on[1] then
+        imgui.TextColored({ 0.53, 0.82, 0.47, 1.0 }, 'ON - a "Global" bar sits above Zone fatigue');
+    else
+        imgui.TextColored({ 0.60, 0.58, 0.54, 1.0 }, 'off');
+    end
+    if M.settings.fatigue.global_on[1] then
+        if imgui.Checkbox('Protect it from /floos clear and Reset Session', M.settings.fatigue.global_protect) then
+            settings.save();
+        end
+        local any = false;
+        local gf_label = { mining = 'Mine', logging = 'Log', harvest = 'Harvest', excavate = 'Excav' };
+        for _, a in ipairs({ 'mining', 'logging', 'harvest', 'excavate' }) do
+            local r = tracker.global_fatigue_record and tracker.global_fatigue_record(a) or nil;
+            if r ~= nil and (r.count or 0) > 0 then
+                any = true;
+                local cap = tracker.fatigue_cap_for and tracker.fatigue_cap_for(a) or 200;
+                imgui.Text(string.format('%-8s %-26s %d / %d',
+                    gf_label[a] or a, tostring(r.zone_name or '?'), r.count or 0, cap));
+                imgui.SameLine();
+                if imgui.SmallButton('Clear##gf' .. a) then
+                    tracker.global_fatigue_clear(a);
+                    settings.save();
+                end
+            end
+        end
+        if not any then
+            imgui.TextDisabled('Nothing counted yet - the first hit sets the home zone.');
+        end
+    end
+
+    imgui.Separator();
+    imgui.Text('Zone advice');
+    imgui.Checkbox('Show "Best for" line', M.settings.tracker.show_best_for);
+    imgui.TextDisabled('Best zone for gil, and best for skill at your current level.');
+
+    imgui.Separator();
+    imgui.Text('Session journal');
+    imgui.Checkbox('Write one line per swing', M.settings.journal.enabled);
+    local st = journal.stats();
+    imgui.TextDisabled(string.format('%d written, %d pending', st.written or 0, st.pending or 0));
+    if st.path ~= nil then
+        imgui.TextDisabled(tostring(st.path));
+    end
+    if st.error ~= nil then
+        imgui.TextColored({ 0.96, 0.44, 0.44, 1.0 }, tostring(st.error));
+    end
+    if imgui.Button('Flush now') then
+        journal.flush();
+    end
+
+    ui.end_child();
 
     imgui.Separator();
     imgui.Text('Zone advice');
@@ -1152,6 +1417,156 @@ local function render_layout()
     ui.end_child();
 end
 
+--- The events a sound can be attached to, in the order they appear.
+local SOUND_ROWS = {
+    { key = 'rank_up',     label = 'Rank Up',
+      help = 'Every 10.0 skill. Six times in a career to 60.' },
+    { key = 'skill_up',    label = 'Skill Up',
+      help = 'Every 0.1. Stays silent on a rank-up so that one has it alone.' },
+    { key = 'big_drop',    label = 'Valuable Drop',
+      help = 'A drop worth at least the gil figure set below.' },
+    { key = 'fatigue_cap', label = 'Fatigue Cap Hit',
+      help = 'The item that lands you on the cap - time to move or stop.' },
+    { key = 'clam_ready',  label = 'Clam Point Ready',
+      help = 'The clamming cooldown finishing. Fires whatever tab you are on.' },
+};
+
+--- One dropdown, built the same way the font picker is, so it uses only
+--- imgui calls already proven to work in this addon.
+---
+--- "None" is a real entry rather than a blank line: an empty combo reads as
+--- broken, and silence for one event needs to be as pickable as any file.
+---@param row table   an entry from SOUND_ROWS
+---@param snd table   libs.sound
+local function render_sound_row(row, snd)
+    local slot = M.settings.sounds[row.key];
+    if slot == nil then
+        return;
+    end
+
+    local cur = slot[1] or '';
+    local preview = (cur ~= '') and cur or 'None';
+    if cur ~= '' and not snd.exists(cur) then
+        preview = cur .. '  (missing)';
+    end
+
+    -- Label first, on its own, then a combo with a hidden label. ImGui puts
+    -- a widget's label to its RIGHT, which read as "[dropdown] Valuable Drop"
+    -- - the name arriving after the thing it names, and colliding with the
+    -- Play button besides.
+    imgui.Text(row.label);
+    imgui.SameLine(140);
+    imgui.SetNextItemWidth(240);
+    if imgui.BeginCombo('##snd_' .. row.key, preview) then
+        if imgui.Selectable('None', cur == '') then
+            slot[1] = '';
+        end
+        if cur == '' then
+            imgui.SetItemDefaultFocus();
+        end
+        for _, file in ipairs(snd.files) do
+            local selected = (file == cur);
+            if imgui.Selectable(file .. '##snd_' .. row.key, selected) then
+                slot[1] = file;
+                -- Play it on pick. Choosing a sound you cannot hear is
+                -- guesswork, and Yield makes you press a separate button.
+                snd.play(file, true);
+            end
+            if selected then
+                imgui.SetItemDefaultFocus();
+            end
+        end
+        imgui.EndCombo();
+    end
+
+    if cur ~= '' then
+        imgui.SameLine();
+        if imgui.Button('Play##snd_' .. row.key) then
+            local ok, why = snd.play(cur, true);
+            if not ok then
+                print(chat.header(addon.name):append(chat.error(
+                    'Sound: ' .. tostring(why))));
+            end
+        end
+    end
+
+    imgui.TextDisabled('    ' .. row.help);
+end
+
+--- The Sound tab.
+local function render_sound()
+    local snd = require('libs.sound');
+    if not snd.scanned then
+        snd.scan();
+    end
+
+    ui.begin_child('floos_sound', { 0, fill_height(200) }, true);
+
+    imgui.Checkbox('Enable Sound Alerts', M.settings.sounds.enabled);
+    imgui.TextDisabled('Master switch. Individual events can also be set to None.');
+
+    imgui.Separator();
+
+    if #snd.files == 0 then
+        imgui.Text('No .wav files found.');
+        imgui.TextDisabled('Drop .wav files into the folder below, then press Rescan.');
+        if snd.scan_error ~= nil then
+            imgui.TextDisabled('Folder read failed: ' .. tostring(snd.scan_error));
+        end
+    else
+        for _, row in ipairs(SOUND_ROWS) do
+            render_sound_row(row, snd);
+        end
+
+        imgui.Separator();
+        imgui.Text('Valuable Drop Threshold');
+        imgui.SameLine(140);
+        imgui.SetNextItemWidth(120);
+        imgui.InputInt('gil##bigdropgil', M.settings.sounds.big_drop_gil);
+        imgui.TextDisabled('    A drop counts as valuable when ONE of it is worth this');
+        imgui.TextDisabled('    much in your price list. Items showing -- are priced at 0');
+        imgui.TextDisabled('    and never trigger it, however rare they actually are.');
+
+        imgui.Separator();
+
+        -- Set-all, borrowed from Yield: handy when you just want to hear
+        -- something on everything and narrow it down afterwards.
+        imgui.Text('Set Every Event To');
+        imgui.SameLine();
+        imgui.SetNextItemWidth(200);
+        if imgui.BeginCombo('##snd_setall', 'Pick one...') then
+            if imgui.Selectable('None##setall', false) then
+                for _, row in ipairs(SOUND_ROWS) do
+                    M.settings.sounds[row.key][1] = '';
+                end
+            end
+            for _, file in ipairs(snd.files) do
+                if imgui.Selectable(file .. '##setall', false) then
+                    for _, row in ipairs(SOUND_ROWS) do
+                        M.settings.sounds[row.key][1] = file;
+                    end
+                    snd.play(file, true);
+                end
+            end
+            imgui.EndCombo();
+        end
+    end
+
+    imgui.Separator();
+    if imgui.Button('Rescan Folder##sounds') then
+        snd.scan();
+        print(chat.header(addon.name):append(chat.message(string.format(
+            '%d sound file%s found.', #snd.files, (#snd.files == 1) and '' or 's'))));
+    end
+    imgui.SameLine();
+    imgui.TextDisabled(string.format('%d file%s in %s',
+        #snd.files, (#snd.files == 1) and '' or 's', snd.dir()));
+    imgui.TextDisabled('The folder is read at load and on Rescan, not every frame.');
+    imgui.TextDisabled('Ashita plays .wav only - convert mp3 first. Keep them short.');
+
+    ui.end_child();
+end
+
 local function render_about()
     ui.begin_child('floos_about', { 0, fill_height(200) }, true);
     imgui.Text('Floos - HELM companion for Ashita 4.3');
@@ -1172,7 +1587,20 @@ function M.render_editor()
     M.ensure_ui_settings();
     imgui.SetNextWindowSize({ 540, 600 }, ImGuiCond_FirstUseEver);
     local style_counts = theme.apply_style();
+
+    -- The chosen typeface, pushed before Begin so the title bar gets it too.
+    -- floos.lua renders this window before its own fonts.push, which is why
+    -- the config used to ignore both the family and the size.
+    fonts.push(M.settings);
+
     if imgui.Begin('Floos##Config', M.editor_open) then
+        -- Size has to be pushed INSIDE Begin: it applies to the current
+        -- window, and there is no current window before this line.
+        local cfg_mult = 1.0;
+        if M.settings.ui and M.settings.ui.config_scale then
+            cfg_mult = tonumber(M.settings.ui.config_scale[1]) or 1.0;
+        end
+        local font_tag = fonts.begin_scale(fonts.get_scale(M.settings) * cfg_mult);
         if imgui.Button('Save') then
             M.update_pricing();
             settings.save();
@@ -1189,9 +1617,12 @@ function M.render_editor()
         imgui.SameLine();
         if imgui.Button('Reset Session') then
             local tracker = require('modules.tracker');
-            tracker.reset_session();
+            -- Same reach as the slash command: an explicit clear takes the
+            -- per-zone fatigue counters with it.
+            tracker.reset_session('all', true);
             settings.save();
-            print(chat.header(addon.name):append(chat.message('Session cleared.')));
+            print(chat.header(addon.name):append(chat.message(
+                'Session cleared, zone fatigue cleared.')));
         end
 
         imgui.Separator();
@@ -1216,14 +1647,20 @@ function M.render_editor()
                 render_layout();
                 imgui.EndTabItem();
             end
+            if imgui.BeginTabItem('Sound') then
+                render_sound();
+                imgui.EndTabItem();
+            end
             if imgui.BeginTabItem('About') then
                 render_about();
                 imgui.EndTabItem();
             end
             imgui.EndTabBar();
         end
+        fonts.end_scale(font_tag);
     end
     imgui.End();
+    fonts.pop();
     theme.pop_style(style_counts);
 end
 

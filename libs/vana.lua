@@ -100,17 +100,45 @@ function M.get_moon(timestamp)
     if percent < 0 then percent = 0; end
     if percent > 100 then percent = 100; end
 
+    -- Phase boundaries are NOT symmetric, and treating them as if they were
+    -- is why a 7% waning moon used to read as Waning Crescent while the game
+    -- itself said New Moon. Horizon's wiki states the windows directly:
+    --
+    --     New Moon    10% -> 0% -> 5%     (waning to 10, waxing only to 5)
+    --     Crescent    10% - 40%
+    --     Quarter     40% - 60%
+    --     Gibbous     60% - 90%
+    --     Full Moon   waxing 90 -> 100, waning 100 -> 95
+    --
+    -- So the same percentage can be two different phases depending on which
+    -- way the moon is going, and the New and Full windows are the pair that
+    -- actually matter: they are the ones with gameplay hung off them.
     local name;
-    if percent <= 5 then
-        name = 'New Moon';
-    elseif percent <= 25 then
-        name = (direction == 'waning') and 'Waning Crescent' or 'Waxing Crescent';
-    elseif percent <= 40 then
-        name = (direction == 'waning') and 'Last Quarter' or 'First Quarter';
-    elseif percent <= 90 then
-        name = (direction == 'waning') and 'Waning Gibbous' or 'Waxing Gibbous';
+    local waning = (direction == 'waning');
+    if waning then
+        if percent <= 10 then
+            name = 'New Moon';
+        elseif percent < 40 then
+            name = 'Waning Crescent';
+        elseif percent <= 60 then
+            name = 'Last Quarter';
+        elseif percent < 95 then
+            name = 'Waning Gibbous';
+        else
+            name = 'Full Moon';
+        end
     else
-        name = 'Full Moon';
+        if percent <= 5 then
+            name = 'New Moon';
+        elseif percent < 40 then
+            name = 'Waxing Crescent';
+        elseif percent <= 60 then
+            name = 'First Quarter';
+        elseif percent < 90 then
+            name = 'Waxing Gibbous';
+        else
+            name = 'Full Moon';
+        end
     end
 
     return {

@@ -1,8 +1,13 @@
 --[[
 * Floos - Overlay font helpers
 *
-* Loads bundled fonts from fush/assets/fonts/ via imgui.AddFontFromFileTTF
-* (same approach as XIUI). Fonts are prewarmed on load - never added mid-frame.
+* Loads TTFs via imgui.AddFontFromFileTTF (same approach as XIUI). Fonts are
+* prewarmed on load - never added mid-frame, which can crash the atlas.
+*
+* Lookup order per font: the Windows font folder first, then the addon's own
+* assets/fonts/ if it has one, then Agave, which needs no file. Windows comes
+* first because Tahoma, Segoe UI, Consolas and Verdana are Microsoft's and are
+* not ours to redistribute - the public build ships none of them.
 ]]--
 
 require('common');
@@ -31,10 +36,56 @@ local prewarmed = false;
 -- and per-module scale apply via begin_scale (legacy SetWindowFontScale or ImGui 1.92+).
 M.BASE_SIZE = 20;
 
+--- Where the addon's own copies would live, if there are any.
 local function fonts_dir()
     local base = (addon and addon.path) or '';
     base = base:gsub('[/\\]+$', '');
     return base .. '/assets/fonts/';
+end
+
+--- The Windows font folder, read from the environment rather than hardcoded
+--- to C:, because Windows is not always installed on C:.
+local function windows_fonts_dir()
+    local root = nil;
+    pcall(function ()
+        root = os.getenv('SystemRoot') or os.getenv('windir') or nil;
+    end);
+    if root == nil or root == '' then
+        root = 'C:\\Windows';
+    end
+    return (tostring(root):gsub('[/\\]+$', '')) .. '\\Fonts\\';
+end
+
+--- Does the file exist and open? Checked before handing a path to ImGui:
+--- AddFontFromFileTTF asserts on a missing file in some builds rather than
+--- returning nil, and an assert inside the font atlas takes Ashita with it.
+---@param path string
+---@return boolean
+local function readable(path)
+    local ok, present = pcall(function ()
+        local f = io.open(path, 'rb');
+        if f == nil then return false; end
+        f:close();
+        return true;
+    end);
+    return ok and present or false;
+end
+
+--- Every place a given font file might be, best first.
+---
+--- Windows comes first on purpose. Tahoma, Segoe UI, Consolas and Verdana are
+--- Microsoft's, licensed with Windows and not ours to redistribute, so the
+--- public build ships none of them and reads the copies already on the
+--- machine instead. The addon-local folder is still checked second, so a
+--- build that does carry its own TTFs - or anyone who drops one in - keeps
+--- working unchanged. Agave needs no file at all and is the floor under both.
+---@param file string
+---@return table
+local function font_candidates(file)
+    return {
+        windows_fonts_dir() .. file,
+        fonts_dir() .. file,
+    };
 end
 
 local function clamp_size(size)
@@ -276,16 +327,26 @@ function M.get_font(label)
         return (cache[label] ~= false) and cache[label] or nil;
     end
 
-    local path = fonts_dir() .. opt.file;
-    local font = try_add_font(path);
+    local font = nil;
+    local tried = T{};
+    for _, path in ipairs(font_candidates(opt.file)) do
+        tried[#tried + 1] = path;
+        if readable(path) then
+            font = try_add_font(path);
+            if font ~= nil then
+                break;
+            end
+        end
+    end
+
     if font == nil then
         cache[label] = false;
         if not warned[label] then
             warned[label] = true;
             print(string.format(
-                '[floos] Could not load font "%s" from %s. Using Default.',
+                '[floos] Could not load font "%s". Using Agave instead. Looked in: %s',
                 label,
-                path
+                table.concat(tried, '  and  ')
             ));
         end
         return nil;

@@ -49,6 +49,8 @@ Panel
   /floos              Open the settings window.
   /floos show|hide    Show or hide the tracker.
   /floos detail       full | compact | mini.
+  /floos menu         Hide behind map / main menu.  (+ recent | add | remove)
+  /floos sound        Sound alerts.  (+ on | off | test <file>)
 Session
   /floos report       Print session stats to chat.
   /floos clear        Clear every session.
@@ -60,8 +62,6 @@ Activity
   /floos clam         Bucket weight, value, break odds.
   /floos fatigue      Reset countdown.  (+ reset)
 Setup
-  /floos prices fetch           Pull live prices from psxi.gg.
-  /floos prices token <token>   Save a psxi.gg API token.
   /floos prices import <file>   Merge a name:price file.
   /floos debug        What the addon is actually seeing.  (+ on | off)
 ```
@@ -77,27 +77,8 @@ chunk of iron ore:650
 tropical clam:5100
 ```
 
-Lowercase, no spaces around the colon, and the name is the one the **chat log**
-uses — `clump of moko grass`, not `moko grass`. The defaults cover every
-harvesting item on the wiki plus the mining, logging and clamming drops; most
-start at 0.
-
-**Restore Default List** in that same tab replaces your list with the current
-default one — the way to pick up items added to the defaults later without
-resetting the rest of your settings. Prices you already entered for an item on
-that list are carried over.
-
-`/floos prices fetch` fills them in from the [psxi.gg](https://www.psxi.gg)
-market snapshot: the 7-day AH average for a single item, falling back to the
-last sale and then to the bazaar average. Only names already on the list are
-touched — it never adds the other five thousand items — and the game hitches
-for a second while the 2MB snapshot downloads and parses.
-
-That endpoint is keyless until **2026-11-01**, after which it needs a free API
-token (psxi.gg → Settings → Account → API Access). Paste one into **API Token**
-in `/floos` → the price tab, next to the **Fetch Prices Now** button, or set it
-with `/floos prices token psxi_...`, and the fetch keeps working across the
-cutover.
+Lowercase, no spaces around the colon. The defaults are rough starting values —
+edit them to your server's actual prices or every gil figure will be wrong.
 
 ---
 
