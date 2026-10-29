@@ -1,9 +1,13 @@
 --[[
 * Floos - Overlay font helpers
 *
-* Loads fonts from assets/fonts/ or the system Fonts folder via
-* imgui.AddFontFromFileTTF
-* (same approach as XIUI). Fonts are prewarmed on load - never added mid-frame.
+* Loads TTFs via imgui.AddFontFromFileTTF (same approach as XIUI). Fonts are
+* prewarmed on load - never added mid-frame, which can crash the atlas.
+*
+* Lookup order per font: the Windows font folder first, then the addon's own
+* assets/fonts/ if it has one, then Agave, which needs no file. Windows comes
+* first because Tahoma, Segoe UI, Consolas and Verdana are Microsoft's and are
+* not ours to redistribute - the public build ships none of them.
 ]]--
 
 require('common');
@@ -11,7 +15,7 @@ local imgui = require('imgui');
 
 local M = {};
 
--- Friendly label -> TTF filename, looked up by font_dirs()
+-- Friendly label -> filename under assets/fonts/
 -- "Agave" keeps Ashita's current ImGui font (no PushFont).
 -- "Tahoma Bold (Default)" is the addon default for overlays.
 M.OPTIONS = T{
@@ -32,18 +36,55 @@ local prewarmed = false;
 -- and per-module scale apply via begin_scale (legacy SetWindowFontScale or ImGui 1.92+).
 M.BASE_SIZE = 20;
 
---- Where a TTF may live, in order of preference: a copy bundled under the
---- addon, then the system font folder. Tahoma, Segoe UI, Consolas and Verdana
---- are Microsoft fonts and redistributing them is not permitted, so they are
---- not in the download - on Windows they are already installed, which is where
---- the second path finds them. See assets/fonts/README.txt.
-local function font_dirs()
+--- Where the addon's own copies would live, if there are any.
+local function fonts_dir()
     local base = (addon and addon.path) or '';
     base = base:gsub('[/\\]+$', '');
-    local windows = (os.getenv('SystemRoot') or 'C:/Windows'):gsub('[/\\]+$', '');
+    return base .. '/assets/fonts/';
+end
+
+--- The Windows font folder, read from the environment rather than hardcoded
+--- to C:, because Windows is not always installed on C:.
+local function windows_fonts_dir()
+    local root = nil;
+    pcall(function ()
+        root = os.getenv('SystemRoot') or os.getenv('windir') or nil;
+    end);
+    if root == nil or root == '' then
+        root = 'C:\\Windows';
+    end
+    return (tostring(root):gsub('[/\\]+$', '')) .. '\\Fonts\\';
+end
+
+--- Does the file exist and open? Checked before handing a path to ImGui:
+--- AddFontFromFileTTF asserts on a missing file in some builds rather than
+--- returning nil, and an assert inside the font atlas takes Ashita with it.
+---@param path string
+---@return boolean
+local function readable(path)
+    local ok, present = pcall(function ()
+        local f = io.open(path, 'rb');
+        if f == nil then return false; end
+        f:close();
+        return true;
+    end);
+    return ok and present or false;
+end
+
+--- Every place a given font file might be, best first.
+---
+--- Windows comes first on purpose. Tahoma, Segoe UI, Consolas and Verdana are
+--- Microsoft's, licensed with Windows and not ours to redistribute, so the
+--- public build ships none of them and reads the copies already on the
+--- machine instead. The addon-local folder is still checked second, so a
+--- build that does carry its own TTFs - or anyone who drops one in - keeps
+--- working unchanged. Agave needs no file at all and is the floor under both.
+---@param file string
+---@return table
+local function font_candidates(file)
     return {
-        base .. '/assets/fonts/',
-        windows .. '/Fonts/',
+        windows_fonts_dir() .. file,
+        fonts_dir() .. file,
     };
 end
 
@@ -247,16 +288,6 @@ local function find_option(label)
 end
 
 local function try_add_font(path)
-    -- AddFontFromFileTTF is native: handed a path that is not there it takes
-    -- the process down with an access violation, and pcall does not catch
-    -- that. Check the file is readable first - every caller comes through
-    -- here, so this is the only place that has to know.
-    local f = io.open(path, 'rb');
-    if f == nil then
-        return nil;
-    end
-    f:close();
-
     -- XIUI uses imgui.AddFontFromFileTTF directly (Ashita binding).
     local size = M.BASE_SIZE;
     local attempts = T{
@@ -297,21 +328,25 @@ function M.get_font(label)
     end
 
     local font = nil;
-    for _, dir in ipairs(font_dirs()) do
-        font = try_add_font(dir .. opt.file);
-        if font ~= nil then
-            break;
+    local tried = T{};
+    for _, path in ipairs(font_candidates(opt.file)) do
+        tried[#tried + 1] = path;
+        if readable(path) then
+            font = try_add_font(path);
+            if font ~= nil then
+                break;
+            end
         end
     end
+
     if font == nil then
         cache[label] = false;
         if not warned[label] then
             warned[label] = true;
             print(string.format(
-                '[floos] Could not load font "%s" (%s) from assets/fonts/ or the '
-                    .. 'system Fonts folder. Using Default.',
+                '[floos] Could not load font "%s". Using Agave instead. Looked in: %s',
                 label,
-                opt.file
+                table.concat(tried, '  and  ')
             ));
         end
         return nil;

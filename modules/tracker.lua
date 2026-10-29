@@ -18,6 +18,7 @@ local weather = require('libs.weather');
 local vis = require('libs.vis');
 local fatigue_lib = require('libs.fatigue');
 local journal = require('libs.journal');
+local sound = require('libs.sound');
 
 local ACTIVITIES = { 'mining', 'logging', 'harvest', 'excavate', 'hunting', 'fishing', 'digging', 'clamming' };
 local TAB_LABELS = {
@@ -122,6 +123,16 @@ local ACT_RULES = {
         success = 'cut off an? ([^,!]+)',
         broke   = 'hatchet breaks',
         unable  = { 'unable to log anything' },
+        -- Attempts that spend a fatigue point and hand you nothing.
+        --
+        -- "Rotting timber splinters and falls apart in your hands." arrives
+        -- as its own line, immediately BEFORE the ordinary "unable to log
+        -- anything", so from here it used to look like a plain miss. The
+        -- server disagrees: the swing produced something and your daily
+        -- allowance was charged for it. Counting only the items you kept is
+        -- what left the meter reading 194/200 while the server had already
+        -- stopped you at 200.
+        wasted  = { 'splinters and falls apart' },
     },
     harvest = {
         success = 'harvest an? ([^,!]+)',
@@ -384,6 +395,10 @@ local M = {
     --   used = px handed to the haul this frame }
     haul = {},
     win_pad_y = nil, -- measured slack between the last item and the window bottom
+    -- Which haul row has its unit price open for editing, if any.
+    -- { key = normalized item name, buf = { '123' }, focus = true on the
+    -- first frame so the caret lands in the box without a second click }.
+    price_edit = nil,
 };
 
 M.TAB_ORDER = TAB_ORDER;
@@ -438,6 +453,11 @@ local function blank_session()
         swings = 0,       -- kills for hunting
         breaks = 0,
         items = 0,
+        -- Logging only: attempts that produced rotting timber. They charge a
+        -- fatigue point and give you nothing, so they are counted apart from
+        -- rewards - there is no item to put in the haul - while still being
+        -- inside `items`, which is the fatigue number.
+        wasted = 0,
         rewards = T{},
         skill_gain = 0,
         skill_w = 0,  -- skill-ups after Win (got item)
@@ -502,10 +522,23 @@ local function blank_session()
 end
 
 local HISTORY_MAX = 40;
-local SAMPLE_MAX = 40;
+local SAMPLE_MAX = 150;   -- 30 minutes at SAMPLE_INTERVAL_S; the chart's reach
 local SAMPLE_INTERVAL_S = 12;
 local FLASH_MS = 1100;
 local BIG_DROP_GIL = 3000;   -- a drop worth this much gets the gold flash
+
+--- What a drop has to be worth to earn a sound. Separate from the flash
+--- above and configurable, because the bar for "flash the row gold" and the
+--- bar for "make a noise in my headphones" are not the same bar.
+local function drop_sound_gil(settings)
+    local d = settings and settings.sounds and settings.sounds.big_drop_gil or nil;
+    local v = d and tonumber(d[1]) or nil;
+    if v == nil or v <= 0 then
+        return BIG_DROP_GIL;
+    end
+    return v;
+end
+
 local RATE_WARMUP_S = 120; -- gph is noise before this much session time
 local AWAIT_TIMEOUT_MS = 20000; -- drop an unresolved swing after this long
 
@@ -548,7 +581,28 @@ M.lifetime_skill_b = 0;  -- skill-ups on Break (never cleared)
 M.lifetime_wins = 0;     -- total successful digs (denom for W %)
 M.lifetime_misses = 0;   -- total unable (denom for M %)
 M.lifetime_break_only = 0; -- break with no item (denom for B %)
+-- Chocobo digging keeps its own pair. The counters above pool every HELM
+-- activity together, and digging is a different game with a different hit
+-- rate - folding it in would drag both averages toward a number that
+-- describes neither.
+M.lifetime_dig_wins = 0;   -- digs that turned up an item
+M.lifetime_dig_digs = 0;   -- digs that spent a green, found or not
+-- Skill-ups by moon phase. Whether the moon moves HELM skill-up odds is
+-- unverified - Horizon publishes nothing and the W/M/B split it replaced
+-- was answering a question nobody had. Three buckets only, because that is
+-- what the game's own moon naming supports without inventing boundaries:
+-- New (<=5%), Full (>=91%), and everything between.
+M.lifetime_moon_new_sw = 0;   -- counted swings under a new moon
+M.lifetime_moon_new_up = 0;   -- skill-ups among them
+M.lifetime_moon_full_sw = 0;
+M.lifetime_moon_full_up = 0;
+M.lifetime_moon_norm_sw = 0;
+M.lifetime_moon_norm_up = 0;
 M.pending_skill_ups = 0; -- skill-up text arrived before dig/miss/break line
+-- The rank-up banner. Horizon announces a HELM rank every 10.0 skill, which
+-- is six times in a career to 60 - rare enough to be worth interrupting the
+-- screen for, and the only moment in a long grind that is actually an event.
+M.rank_toast = nil;  -- { at_ms, act, rank }
 
 -- Current zone visit. Aggregates live in settings.lifetime.zstats.
 M.zone_visit = {
@@ -629,13 +683,77 @@ end
 --- timeout never fire: subtracting two wrapping components gives a garbage
 --- (often negative) gap, so the panel always looked like it had just been
 --- used and never hid itself.
-local function now_ms()
-    local frac = 0;
-    local ok, c = pcall(function () return ashita.time.clock()['ms']; end);
-    if ok and type(c) == 'number' then
-        frac = math.floor(c) % 1000;
+--- Read an optional settings.ui flag without exploding on old configs.
+--- Defined up here rather than beside the drawing helpers because
+--- handle_text needs it, and a `local` is only visible to code that
+--- comes after it - below, it silently resolved to a nil global.
+local function ui_flag(settings, key, fallback)
+    local u = settings ~= nil and settings.ui or nil;
+    if u == nil or u[key] == nil then
+        return fallback;
     end
-    return (os.time() * 1000) + frac;
+    local v = u[key][1];
+    if v == nil then
+        return fallback;
+    end
+    return v;
+end
+
+--- Milliseconds since the epoch, guaranteed never to go backwards.
+---
+--- This used to be os.time() * 1000 plus a sub-second fraction taken from
+--- ashita.time.clock(). Those two clocks are not phase-locked, so the sum
+--- could jump backwards by up to a second at any moment. Every animation in
+--- this file is a `now - then` delta, and the banner code read a negative
+--- age as "expired" and threw the toast away - which is why a ten-second
+--- banner sometimes lasted a single frame and sometimes ran in full. A coin
+--- flip on where in the second it happened to be armed.
+---
+--- os.clock() is wall time since process start on Windows, which is what
+--- Ashita runs on, so it gives a smooth monotonic sub-second source. The
+--- os.time() epoch is kept as the base because session timestamps are
+--- persisted against it. The drift check re-syncs if os.clock() turns out
+--- to measure something other than wall time, and the ratchet at the end
+--- means even a re-sync can never hand back a smaller number than last time.
+local now_ms_base = nil;   -- os.time() * 1000 when the clock was last synced
+local now_ms_c0 = nil;     -- os.clock() at that same moment
+local now_ms_last = 0;
+
+local function now_ms()
+    local c = nil;
+    do
+        local ok, v = pcall(os.clock);
+        if ok and type(v) == 'number' then
+            c = v;
+        end
+    end
+
+    local wall = os.time() * 1000;
+    local out;
+
+    if c == nil then
+        out = wall;
+    else
+        if now_ms_base == nil then
+            now_ms_base = wall;
+            now_ms_c0 = c;
+        end
+        out = now_ms_base + math.floor((c - now_ms_c0) * 1000);
+
+        -- A minute of disagreement means os.clock() is not tracking wall
+        -- time here. Re-base on the wall clock and carry on.
+        if math.abs(wall - out) > 60000 then
+            now_ms_base = wall;
+            now_ms_c0 = c;
+            out = wall;
+        end
+    end
+
+    if out < now_ms_last then
+        out = now_ms_last;
+    end
+    now_ms_last = out;
+    return out;
 end
 
 local function title_case(name)
@@ -657,6 +775,7 @@ function M.bind_settings(settings_ref)
     -- The zone index caches rows of the old table; force a rebuild from the
     -- new one, otherwise zone credit keeps flowing into the dead table.
     M.zone_stats = nil;
+    M.zf_index = nil;
     if settings_ref ~= nil then
         if settings_ref.lifetime == nil then
             settings_ref.lifetime = T{
@@ -680,7 +799,21 @@ function M.bind_settings(settings_ref)
         M.lifetime_wins = tonumber(settings_ref.lifetime.wins[1]) or 0;
         M.lifetime_misses = tonumber(settings_ref.lifetime.misses[1]) or 0;
         M.lifetime_break_only = tonumber(settings_ref.lifetime.break_only[1]) or 0;
+        if settings_ref.lifetime.dig_wins ~= nil then
+            M.lifetime_dig_wins = tonumber(settings_ref.lifetime.dig_wins[1]) or 0;
+        end
+        if settings_ref.lifetime.dig_digs ~= nil then
+            M.lifetime_dig_digs = tonumber(settings_ref.lifetime.dig_digs[1]) or 0;
+        end
+        for _, k in ipairs({ 'moon_new_sw', 'moon_new_up', 'moon_full_sw',
+                             'moon_full_up', 'moon_norm_sw', 'moon_norm_up' }) do
+            if settings_ref.lifetime[k] ~= nil then
+                M['lifetime_' .. k] = tonumber(settings_ref.lifetime[k][1]) or 0;
+            end
+        end
         M.index_zone_stats();
+        M.index_zone_fatigue();
+        M.index_global_fatigue();
         -- Legacy skill-up counts without matching outcome totals → rates >100%.
         -- Reset rate pairs so W/M/B rebuild cleanly from this point.
         local bad = (M.lifetime_skill_w > M.lifetime_wins)
@@ -714,6 +847,26 @@ function M.get_lifetime_wmb()
 end
 
 -- skill-up rate per outcome: skill_ups_on_X / total_X
+--- Skill-up rate per moon bucket, as percentages, plus the swing counts
+--- behind them so the caller can tell a real difference from three swings
+--- of noise.
+function M.get_lifetime_moon_rates()
+    local function rate(num, den)
+        if den <= 0 then return 0; end
+        local r = (num / den) * 100;
+        if r > 100 then r = 100; end
+        if r < 0 then r = 0; end
+        return r;
+    end
+    local ns = tonumber(M.lifetime_moon_new_sw) or 0;
+    local fs = tonumber(M.lifetime_moon_full_sw) or 0;
+    local os_ = tonumber(M.lifetime_moon_norm_sw) or 0;
+    return rate(tonumber(M.lifetime_moon_new_up) or 0, ns),
+           rate(tonumber(M.lifetime_moon_full_up) or 0, fs),
+           rate(tonumber(M.lifetime_moon_norm_up) or 0, os_),
+           ns, fs, os_;
+end
+
 function M.get_lifetime_wmb_rates()
     local sw = tonumber(M.lifetime_skill_w) or 0;
     local sm = tonumber(M.lifetime_skill_m) or 0;
@@ -761,7 +914,19 @@ local function fatigue_state()
     };
 end
 
-function M.fatigue_time_left()
+--- The 24-hour countdown belongs to DIGGING and nothing else.
+---
+--- Chocobo digging is the one activity with a real daily allowance on a
+--- real-life clock - the rest run on a rolling fatigue window that has no
+--- fixed reset to count down to. Showing "next reset in 6h" on the mining
+--- tab was inviting people to sit and wait for something that was never
+--- going to happen.
+---
+---@param act string|nil  the activity asking; nil means "no tab in mind"
+function M.fatigue_time_left(act)
+    if act ~= nil and act ~= 'digging' then
+        return nil;
+    end
     local st = fatigue_state();
     if st == nil then
         return nil;
@@ -777,9 +942,220 @@ function M.fatigue_confidence()
     return fatigue_lib.confidence(st);
 end
 
---- Fatigue is the session's item count, the way it was before 1.9.0. One
+----------------------------------------------------------------------
+-- Zone-specific fatigue
+--
+-- On Horizon the HELM allowance is per zone: 50 of 200 in Palborough is
+-- 50 of 200 in Palborough whether you spent the rest of the night in
+-- Zhayolm or not. The session counter cannot say that, because a session
+-- follows you across zones. This keeps one counter per zone per activity,
+-- persisted in settings so it is still right after a relog.
+--
+-- Applies to mining, logging, harvesting and excavation. Digging is left
+-- alone on purpose: its allowance is a daily one on a real clock, and it
+-- already has its own machinery.
+--
+-- Unlike the session counter, these have to clear themselves - a persistent
+-- 200/200 that never goes down is worse than no counter. Two things clear a
+-- zone: the configured period elapsing since its first item, and a
+-- witnessed reset (gathering successfully while at the cap).
+----------------------------------------------------------------------
+
+local ZONE_FATIGUE_ACTS = { mining = true, logging = true, harvest = true, excavate = true };
+
+--- In-memory index over the settings array, 'act:zone id' -> record.
+M.zf_index = nil;
+
+local function zone_fatigue_on(act)
+    if M.settings_ref == nil or M.settings_ref.fatigue == nil then return false; end
+    local f = M.settings_ref.fatigue;
+    if f.per_zone == nil or not f.per_zone[1] then return false; end
+    return ZONE_FATIGUE_ACTS[act] == true;
+end
+M.zone_fatigue_on = zone_fatigue_on;
+
+--- The settings-backed array. An array rather than a keyed table for the
+--- same reason zstats is: Ashita's settings serializer round-trips arrays.
+local function ensure_zf_store()
+    if M.settings_ref == nil then return nil; end
+    if M.settings_ref.fatigue == nil then
+        M.settings_ref.fatigue = T{ observations = T{}, period_hours = T{ 24 }, last_seen = T{ 0 } };
+    end
+    local f = M.settings_ref.fatigue;
+    if f.zones == nil then f.zones = T{}; end
+    return f.zones;
+end
+
+function M.index_zone_fatigue()
+    M.zf_index = {};
+    local arr = ensure_zf_store();
+    if arr == nil then return; end
+    for _, r in ipairs(arr) do
+        local id = tonumber(r.id) or 0;
+        if id > 0 and r.act ~= nil then
+            r.items = tonumber(r.items) or 0;
+            r.since = tonumber(r.since) or 0;
+            M.zf_index[tostring(r.act) .. ':' .. tostring(id)] = r;
+        end
+    end
+end
+
+local function zf_period_s()
+    local f = M.settings_ref and M.settings_ref.fatigue or nil;
+    local hours = (f and f.period_hours and tonumber(f.period_hours[1])) or 24;
+    if hours <= 0 then hours = 24; end
+    return hours * 3600;
+end
+
+--- Lazily clear a record whose period has run out. Done on read rather
+--- than on a timer, so a record that sat untouched for a week is right
+--- the moment it is looked at.
+local function zf_expire(r, now)
+    if r == nil then return; end
+    if (r.since or 0) > 0 and (now - r.since) >= zf_period_s() then
+        r.items = 0;
+        r.since = 0;
+    end
+end
+
+--- The record for an activity in a zone. nil when there is none and
+--- create is false.
+local function zf_record(act, zid, zname, create)
+    zid = tonumber(zid) or 0;
+    if zid <= 0 or act == nil then return nil; end
+    if M.zf_index == nil then M.index_zone_fatigue(); end
+
+    local key = tostring(act) .. ':' .. tostring(zid);
+    local r = M.zf_index[key];
+    if r ~= nil then
+        if zname ~= nil and zname ~= 'Unknown' then r.name = zname; end
+        zf_expire(r, os.time());
+        return r;
+    end
+    if not create then return nil; end
+
+    local arr = ensure_zf_store();
+    if arr == nil then return nil; end
+    r = T{ act = act, id = zid, name = zname or 'Unknown', items = 0, since = 0 };
+    arr:append(r);
+    M.zf_index[key] = r;
+    return r;
+end
+
+--- Bump the current zone's counter for an activity. Called on every
+--- successful gather; a no-op unless the feature is on for that activity.
+local function zf_bump(act)
+    if not zone_fatigue_on(act) then return; end
+    M.refresh_zone();
+    local r = zf_record(act, M.zone_id, M.zone_name, true);
+    if r == nil then return; end
+    if (r.since or 0) <= 0 then r.since = os.time(); end
+    r.items = (r.items or 0) + 1;
+    M.session_dirty = true;
+end
+
+--- Zero one zone's counter. Used when a reset is witnessed and by the
+--- config's Clear buttons. zid nil means the zone you are standing in.
+function M.zone_fatigue_clear(act, zid)
+    if M.zf_index == nil then M.index_zone_fatigue(); end
+    if zid == nil then
+        M.refresh_zone();
+        zid = M.zone_id;
+    end
+    local r = zf_record(act, zid, nil, false);
+    if r ~= nil then
+        r.items = 0;
+        r.since = 0;
+        M.session_dirty = true;
+    end
+end
+
+--- Clear every zone's counter for one activity. Used when a session is
+--- cleared for a single activity.
+function M.zone_fatigue_clear_act(act)
+    if M.zf_index == nil then M.index_zone_fatigue(); end
+    for _, r in pairs(M.zf_index) do
+        if r.act == act then
+            r.items = 0;
+            r.since = 0;
+        end
+    end
+    M.session_dirty = true;
+end
+
+function M.zone_fatigue_clear_all()
+    local arr = ensure_zf_store();
+    if arr ~= nil then
+        while #arr > 0 do table.remove(arr); end
+    end
+    M.zf_index = {};
+    M.session_dirty = true;
+end
+
+--- Every zone record with something in it, for the config list. Expired
+--- records are cleared on the way past.
+function M.zone_fatigue_rows()
+    if M.zf_index == nil then M.index_zone_fatigue(); end
+    local now = os.time();
+    local out = T{};
+    for _, r in pairs(M.zf_index) do
+        zf_expire(r, now);
+        if (r.items or 0) > 0 then
+            out:append(r);
+        end
+    end
+    table.sort(out, function (a, b)
+        if a.act ~= b.act then return tostring(a.act) < tostring(b.act); end
+        return tostring(a.name) < tostring(b.name);
+    end);
+    return out;
+end
+
+--- One line per zone with something counted, for /floos zones.
+function M.zone_fatigue_report()
+    local out = T{};
+    if not (M.settings_ref and M.settings_ref.fatigue
+        and M.settings_ref.fatigue.per_zone and M.settings_ref.fatigue.per_zone[1]) then
+        out:append('Zone fatigue is OFF - the meter is showing the session count.');
+        out:append('Turn it on in the config, Data tab.');
+        return out;
+    end
+
+    M.refresh_zone();
+    local rows = M.zone_fatigue_rows();
+    if #rows == 0 then
+        out:append('Zone fatigue is on. Nothing counted in any zone yet.');
+        return out;
+    end
+    for _, r in ipairs(rows) do
+        local cap = M.fatigue_cap_for(r.act);
+        local here = ((tonumber(r.id) or 0) == (M.zone_id or 0)) and '  <- here' or '';
+        out:append(string.format('%-9s %-24s %s%s',
+            tostring(r.act), tostring(r.name),
+            cap and string.format('%d / %d', r.items or 0, cap) or tostring(r.items or 0),
+            here));
+    end
+    return out;
+end
+
+--- Seconds until a zone's counter clears on its own, or nil if it is
+--- empty. The period counts from the zone's first item.
+function M.zone_fatigue_left(r)
+    if r == nil or (r.since or 0) <= 0 then return nil; end
+    local left = zf_period_s() - (os.time() - r.since);
+    if left < 0 then left = 0; end
+    return left;
+end
+
+--- Fatigue is the session's item count, the way it was before 1.9.0 - one
 --- number, cleared by /floos clear, never touched by anything automatic.
+--- With zone-specific fatigue on, it is this zone's count instead.
 function M.fatigue_items(act)
+    if zone_fatigue_on(act) then
+        M.refresh_zone();
+        local r = zf_record(act, M.zone_id, M.zone_name, false);
+        return (r and r.items) or 0;
+    end
     return sess(act).items or 0;
 end
 
@@ -801,12 +1177,184 @@ end
 --- Gathering while already at the cap can only mean the server cleared it.
 --- That is worth learning from, so it is recorded - but nothing is reset.
 local function note_reset_if_capped(act, cap)
-    local before = sess(act).items or 0;
+    local before = M.fatigue_items(act);
     if cap ~= nil and cap > 0 and before >= cap then
-        M.fatigue_reset(true, os.time());
+        -- Only digging teaches the schedule. The other activities cap on a
+        -- rolling window, so "capped then gathered anyway" there says nothing
+        -- about when the daily clock rolls over, and feeding it in was
+        -- dragging the prediction around.
+        if act == 'digging' then
+            M.fatigue_reset(true, os.time());
+        end
+        -- A persistent per-zone count has to clear when the server does, or
+        -- it says 200/200 for ever. The session counter is left alone.
+        if zone_fatigue_on(act) then
+            M.zone_fatigue_clear(act);
+        end
         return true;
     end
     return false;
+end
+
+----------------------------------------------------------------------
+-- Global fatigue
+--
+-- One counter per activity that follows you between zones. It climbs to
+-- the cap in the zone you are working - its "home" - and then every hit
+-- in ANY other zone takes one off it. So 200/200 in Halvung, walk to
+-- Newton, ten hits there, and the Halvung figure reads 190/200.
+--
+-- This is the model Tyflow described in tells - "its still -1 from zeruhn
+-- when you mine anywhere else" - and the addon is the instrument for
+-- finding out whether it is right. So it is built exactly as described,
+-- switched off by default, and can be set to any number for a test.
+--
+-- It is deliberately protected from /floos clear, because a counter that
+-- exists to be watched across zones is worthless if clearing a session
+-- wipes it. The protection is its own toggle.
+----------------------------------------------------------------------
+
+M.gf_index = nil;
+
+local function global_fatigue_on(act)
+    if M.settings_ref == nil or M.settings_ref.fatigue == nil then return false; end
+    local f = M.settings_ref.fatigue;
+    if f.global_on == nil or not f.global_on[1] then return false; end
+    return ZONE_FATIGUE_ACTS[act] == true;
+end
+M.global_fatigue_on = global_fatigue_on;
+
+function M.global_fatigue_protected()
+    if M.settings_ref == nil or M.settings_ref.fatigue == nil then return true; end
+    local f = M.settings_ref.fatigue;
+    if f.global_protect == nil then return true; end
+    return f.global_protect[1] == true;
+end
+
+local function ensure_gf_store()
+    if M.settings_ref == nil then return nil; end
+    if M.settings_ref.fatigue == nil then
+        M.settings_ref.fatigue = T{ observations = T{}, period_hours = T{ 24 }, last_seen = T{ 0 } };
+    end
+    local f = M.settings_ref.fatigue;
+    if f.global == nil then f.global = T{}; end
+    return f.global;
+end
+
+function M.index_global_fatigue()
+    M.gf_index = {};
+    local arr = ensure_gf_store();
+    if arr == nil then return; end
+    for _, r in ipairs(arr) do
+        if r.act ~= nil then
+            r.count = tonumber(r.count) or 0;
+            r.zone_id = tonumber(r.zone_id) or 0;
+            M.gf_index[tostring(r.act)] = r;
+        end
+    end
+end
+
+--- The record for an activity: { act, count, zone_id, zone_name }.
+local function gf_record(act, create)
+    if act == nil then return nil; end
+    if M.gf_index == nil then M.index_global_fatigue(); end
+    local r = M.gf_index[act];
+    if r ~= nil or not create then return r; end
+    local arr = ensure_gf_store();
+    if arr == nil then return nil; end
+    r = T{ act = act, count = 0, zone_id = 0, zone_name = '' };
+    arr:append(r);
+    M.gf_index[act] = r;
+    return r;
+end
+M.global_fatigue_record = function (act) return gf_record(act, false); end
+
+--- One successful gather. Up in the home zone, down anywhere else.
+local function gf_bump(act)
+    if not global_fatigue_on(act) then return; end
+    M.refresh_zone();
+    local r = gf_record(act, true);
+    if r == nil then return; end
+    local here = tonumber(M.zone_id) or 0;
+    if here <= 0 then return; end
+    local cap = (M.fatigue_cap_for(act) or 200);
+
+    if (r.zone_id or 0) <= 0 or (r.count or 0) <= 0 then
+        -- Nothing on the counter: wherever you are becomes home.
+        r.zone_id = here;
+        r.zone_name = M.zone_name or 'Unknown';
+        r.count = 1;
+    elseif r.zone_id == here then
+        r.count = math.min(cap, (r.count or 0) + 1);
+        if M.zone_name ~= nil and M.zone_name ~= 'Unknown' then r.zone_name = M.zone_name; end
+    else
+        r.count = math.max(0, (r.count or 0) - 1);
+        if r.count == 0 then
+            -- Worked all the way back down: the next hit anywhere starts
+            -- a new home.
+            r.zone_id = 0;
+            r.zone_name = '';
+        end
+    end
+    M.session_dirty = true;
+end
+
+--- Set it by hand, for testing. n nil or 0 empties it and forgets the home.
+function M.global_fatigue_set(act, n, zone_id, zone_name)
+    local r = gf_record(act, true);
+    if r == nil then return false; end
+    n = math.max(0, math.floor(tonumber(n) or 0));
+    r.count = n;
+    if n == 0 then
+        r.zone_id = 0; r.zone_name = '';
+    else
+        M.refresh_zone();
+        r.zone_id = tonumber(zone_id) or (r.zone_id > 0 and r.zone_id) or (M.zone_id or 0);
+        r.zone_name = zone_name or ((r.zone_name ~= '' and r.zone_name) or M.zone_name or 'Unknown');
+    end
+    M.session_dirty = true;
+    return true;
+end
+
+--- Empty one activity's counter, or all of them. Honoured regardless of
+--- protection - this is the explicit command, not a side effect.
+function M.global_fatigue_clear(act)
+    if M.gf_index == nil then M.index_global_fatigue(); end
+    for a, r in pairs(M.gf_index) do
+        if act == nil or act == 'all' or a == act then
+            r.count = 0; r.zone_id = 0; r.zone_name = '';
+        end
+    end
+    M.session_dirty = true;
+end
+
+--- One line per activity with something on it, for /floos global.
+function M.global_fatigue_report()
+    local out = T{};
+    if M.settings_ref == nil or M.settings_ref.fatigue == nil
+        or M.settings_ref.fatigue.global_on == nil or not M.settings_ref.fatigue.global_on[1] then
+        out:append('Global fatigue is OFF. /floos global on');
+        return out;
+    end
+    if M.gf_index == nil then M.index_global_fatigue(); end
+    M.refresh_zone();
+    local any = false;
+    for _, act in ipairs({ 'mining', 'logging', 'harvest', 'excavate' }) do
+        local r = M.gf_index[act];
+        if r ~= nil and (r.count or 0) > 0 then
+            any = true;
+            local cap = (M.fatigue_cap_for(act) or 200);
+            local here = ((r.zone_id or 0) == (M.zone_id or 0)) and '  <- you are here, it climbs' or '  (elsewhere: every hit takes one off)';
+            out:append(string.format('%-9s %3d / %-3d  home: %s%s', act, r.count or 0, cap, tostring(r.zone_name or '?'), here));
+        end
+    end
+    if not any then
+        out:append('Global fatigue is on. Nothing counted yet - the first hit sets the home zone.');
+    end
+    out:append(M.global_fatigue_protected()
+        and 'Protected: /floos clear leaves it alone. /floos global protect off to change that.'
+        or 'NOT protected: /floos clear will wipe it. /floos global protect on to keep it.');
+    return out;
 end
 
 ----------------------------------------------------------------------
@@ -886,6 +1434,29 @@ function M.index_zone_stats()
             r.items = tonumber(r.items) or 0;
             r.breaks = tonumber(r.breaks) or 0;
             r.visits = tonumber(r.visits) or 0;
+            -- Left absent on old records rather than zeroed, so the report
+            -- can tell "never tracked here" from "tracked, found none".
+            if r.loot_swings ~= nil then
+                r.loot_swings = tonumber(r.loot_swings) or 0;
+            end
+            if r.loot_items ~= nil then
+                r.loot_items = tonumber(r.loot_items) or 0;
+            end
+            -- Records written before per-item tracking existed simply have
+            -- no loot field. That is not an error and must not be repaired
+            -- by writing anything over them: leave the field absent, let it
+            -- appear the first time an item is actually recorded there.
+            if r.loot ~= nil then
+                local clean = T{};
+                for _, e in ipairs(r.loot) do
+                    local n = e.n;
+                    local c = tonumber(e.c) or 0;
+                    if type(n) == 'string' and n ~= '' and c > 0 then
+                        clean:append(T{ n = n, c = c });
+                    end
+                end
+                r.loot = clean;
+            end
             M.zone_stats[zkey(act, id, r.band)] = r;
         end
     end
@@ -1044,8 +1615,48 @@ local function zone_tick(act, id, name)
     return v, rec;
 end
 
+--- Per-item tally on a zone record.
+---
+--- Stored as an ARRAY of { n = name, c = count } rather than a keyed table,
+--- because Ashita's settings serialiser round-trips arrays reliably and
+--- sparse string keys - which item names are - much less so. That lesson
+--- was paid for once already and is not being relearned.
+---
+--- The field is created lazily and nothing else on the record is touched,
+--- so a settings file written by an older Floos loads unchanged and simply
+--- begins collecting from today. No existing history is read, rewritten or
+--- discarded anywhere in this feature.
+local function loot_bump(rec, name, qty)
+    if rec == nil or name == nil or name == '' then return; end
+    qty = tonumber(qty) or 1;
+    if rec.loot == nil then rec.loot = T{}; end
+    for _, e in ipairs(rec.loot) do
+        if e.n == name then
+            e.c = (tonumber(e.c) or 0) + qty;
+            return;
+        end
+    end
+    rec.loot:append(T{ n = name, c = qty });
+end
+
+--- Activities where every ATTEMPT reaches zone_record_swing, successful or
+--- not. For these, "one in N swings" is a real number.
+---
+--- Fishing, digging, clamming and hunting only report their successes -
+--- there is no reliable "you cast and caught nothing" line to hook for all
+--- of them - so their denominator is finds, not attempts. That makes
+--- "% of your haul" the honest figure there and "per swing" meaningless,
+--- and the report says which it is showing rather than printing a 100%
+--- that means nothing.
+local FULL_ATTEMPT_ACTS = {
+    mining = true, logging = true, harvest = true, excavate = true,
+};
+M.FULL_ATTEMPT_ACTS = FULL_ATTEMPT_ACTS;
+
 --- Record one counted swing against the current zone.
-function M.zone_record_swing(act, gil, got_item, broke, failed)
+--- `item_name` and `qty` are optional and additive - callers that pass only
+--- the boolean behave exactly as they did before.
+function M.zone_record_swing(act, gil, got_item, broke, failed, item_name, qty)
     local v = M.zone_visit;
     if v == nil or (v.id or 0) <= 0 then
         return;
@@ -1074,6 +1685,25 @@ function M.zone_record_swing(act, gil, got_item, broke, failed)
             r.gil = (r.gil or 0) + gil;
             if got_item then r.items = (r.items or 0) + 1; end
             if broke then r.breaks = (r.breaks or 0) + 1; end
+        end
+    end
+    -- Per-item tally goes on the zone aggregate only, not on every skill
+    -- band. Banding it would multiply the rows by every band you have ever
+    -- mined at, for a question - "how common is Khroma here" - that is not
+    -- asked per band.
+    --
+    -- loot_swings is the denominator that makes the rate honest. Lifetime
+    -- `swings` includes everything you ever did here, including thousands
+    -- of swings from before per-item tracking existed, which could not
+    -- possibly have counted an item. Dividing by that would report a rate
+    -- several times too low. So this counts only swings taken while the
+    -- tally was actually running, and the report divides by it.
+    if rec ~= nil then
+        local n = math.max(1, math.floor(tonumber(qty) or 1));
+        rec.loot_swings = (tonumber(rec.loot_swings) or 0) + 1;
+        if got_item then
+            rec.loot_items = (tonumber(rec.loot_items) or 0) + n;
+            if item_name ~= nil then loot_bump(rec, item_name, n); end
         end
     end
     M.session_dirty = true;
@@ -1302,6 +1932,134 @@ function M.zone_verdict_line(verdict)
 end
 
 --- /floos zones
+--- Per-item rate, by zone. Answers "how common is Khroma here, really" -
+--- which needs a denominator, and the denominator that matters is SWINGS,
+--- not items. A 0.4% per-swing rate and a 3% share of your haul are
+--- different numbers answering different questions, so both are shown.
+---
+--- Matching is a case-insensitive substring, so "khroma" finds "Khroma
+--- Ore" without anyone having to type it exactly.
+---@param query string
+---@param act string|nil  limit to one activity, or nil for all
+---@return table lines
+function M.item_rate_report(query, act)
+    local lines = T{};
+    local q = tostring(query or ''):lower():match('^%s*(.-)%s*$');
+    if q == '' then
+        lines:append('Usage: /floos item <name>   e.g. /floos item khroma');
+        return lines;
+    end
+
+    if M.zone_stats == nil then M.index_zone_stats(); end
+
+    -- Gather every (zone, activity) that has ever produced a match. Only
+    -- band-0 records carry loot, so the banded duplicates are skipped.
+    local rows, matched_names = T{}, {};
+    local tot_hits, tot_swings, tot_items = 0, 0, 0;
+    for _, r in pairs(M.zone_stats or {}) do
+        if (tonumber(r.band) or 0) == 0 and r.loot ~= nil then
+            local hits = 0;
+            for _, e in ipairs(r.loot) do
+                local n = tostring(e.n or '');
+                if n:lower():find(q, 1, true) ~= nil then
+                    hits = hits + (tonumber(e.c) or 0);
+                    matched_names[n] = true;
+                end
+            end
+            if hits > 0 and (act == nil or r.act == act) then
+                -- Denominators: only swings taken while the tally was
+                -- running. Falling back to the lifetime figure would divide
+                -- today's item count by years of swings and report a rate
+                -- several times too low.
+                local sw = tonumber(r.loot_swings) or 0;
+                local it = tonumber(r.loot_items) or 0;
+                rows:append({
+                    name = r.name or 'Unknown', act = r.act,
+                    hits = hits, swings = sw, items = it,
+                    lifetime_swings = tonumber(r.swings) or 0,
+                    secs = tonumber(r.secs) or 0,
+                });
+                tot_hits = tot_hits + hits;
+                tot_swings = tot_swings + sw;
+                tot_items = tot_items + it;
+            end
+        end
+    end
+
+    if #rows == 0 then
+        lines:append(string.format('No record of "%s" yet.', query));
+        lines:append('Per-item tracking starts from the version that added it,');
+        lines:append('so swings from before then are not counted here. Your');
+        lines:append('lifetime zone totals are untouched - see /floos zones.');
+        return lines;
+    end
+
+    -- Best per-swing rate first: that is the "where should I go" answer.
+    table.sort(rows, function (a, b)
+        local ra = (a.swings > 0) and (a.hits / a.swings) or 0;
+        local rb = (b.swings > 0) and (b.hits / b.swings) or 0;
+        if ra ~= rb then return ra > rb; end
+        return a.hits > b.hits;
+    end);
+
+    local names = T{};
+    for n in pairs(matched_names) do names:append(n); end
+    table.sort(names);
+    lines:append(string.format('~~~~~~ Floos Item Rate: %s ~~~~~~',
+        table.concat(names, ', ')));
+    lines:append(string.format('%-20s %7s %8s %9s %7s  %s',
+        'Zone', 'Got', 'Tries', 'Per try', '% haul', 'Activity'));
+
+    for _, r in ipairs(rows) do
+        local share = (r.items > 0) and (r.hits / r.items * 100) or 0;
+        local hrs = r.secs / 3600;
+        -- Only the four dig-style activities count misses, so only they can
+        -- honestly answer "how often does a try give me this". Everywhere
+        -- else a per-try figure would just restate that every recorded
+        -- event was a find, so it is left blank rather than printed as 100%.
+        local per_try = '        -';
+        if FULL_ATTEMPT_ACTS[r.act] and r.swings > 0 then
+            per_try = string.format('%8.2f%%', r.hits / r.swings * 100);
+        end
+        lines:append(string.format('%-20s %7d %8d %s %6.1f%%  %s%s',
+            tostring(r.name):sub(1, 20), r.hits, r.swings, per_try, share,
+            (TAB_LABELS[r.act] or r.act or ''),
+            (hrs >= 0.1) and string.format(' %.1fh', hrs) or ''));
+    end
+
+    if #rows > 1 then
+        -- The per-try total is summed only over activities that count
+        -- misses; mixing fishing's finds into a mining denominator would
+        -- quietly deflate the rate.
+        local fh, fs = 0, 0;
+        for _, r in ipairs(rows) do
+            if FULL_ATTEMPT_ACTS[r.act] then fh = fh + r.hits; fs = fs + r.swings; end
+        end
+        local ps = (fs > 0) and string.format('%8.2f%%', fh / fs * 100) or '        -';
+        local sh = (tot_items > 0) and (tot_hits / tot_items * 100) or 0;
+        lines:append(string.format('%-20s %7d %8d %s %6.1f%%',
+            'ALL ZONES', tot_hits, tot_swings, ps, sh));
+    end
+    lines:append('Per try = chance one swing/dig yields it. % haul = share of finds.');
+    lines:append('Fish, dig, clam and hunt log finds only, so they show % haul.');
+
+    -- Say plainly when the sample is younger than the history, so nobody
+    -- reads a rate off a hundred swings as if it were off ten thousand.
+    local older = 0;
+    for _, r in ipairs(rows) do
+        if r.lifetime_swings > r.swings then
+            older = older + (r.lifetime_swings - r.swings);
+        end
+    end
+    if older > 0 then
+        lines:append(string.format(
+            'Counted over %d swings since per-item tracking began.', tot_swings));
+        lines:append(string.format(
+            '%d earlier swings are in your lifetime totals but predate it.', older));
+    end
+    return lines;
+end
+
 function M.build_zone_report(settings, act)
     act = act or M.active_tab;
     local skill_metric = metric_is_skill(settings);
@@ -1368,7 +2126,26 @@ function M.clear_zone_stats()
     M.session_dirty = true;
 end
 
---- Lifetime dig accuracy (wins / all outcomes), or nil with no data.
+--- Lifetime dig accuracy, or nil until a dig has been recorded. Built from
+--- your own play: Horizon publishes no dig odds, so there is nothing to
+--- predict against and this is the honest substitute.
+function M.get_lifetime_dig_accuracy()
+    local d = tonumber(M.lifetime_dig_digs) or 0;
+    if d <= 0 then
+        return nil;
+    end
+    return ((tonumber(M.lifetime_dig_wins) or 0) / d) * 100;
+end
+
+--- Record one dig outcome against the lifetime pair.
+function M.add_lifetime_dig(found)
+    M.lifetime_dig_digs = (tonumber(M.lifetime_dig_digs) or 0) + 1;
+    if found then
+        M.lifetime_dig_wins = (tonumber(M.lifetime_dig_wins) or 0) + 1;
+    end
+end
+
+--- Lifetime HELM accuracy (wins / all outcomes), or nil with no data.
 function M.get_lifetime_accuracy()
     local w = tonumber(M.lifetime_wins) or 0;
     local m = tonumber(M.lifetime_misses) or 0;
@@ -1404,10 +2181,42 @@ local function save_lifetime_skill()
     M.settings_ref.lifetime.skill_b[1] = M.lifetime_skill_b or 0;
     M.settings_ref.lifetime.wins[1] = M.lifetime_wins or 0;
     M.settings_ref.lifetime.misses[1] = M.lifetime_misses or 0;
+    if M.settings_ref.lifetime.dig_wins == nil then M.settings_ref.lifetime.dig_wins = T{ 0 }; end
+    if M.settings_ref.lifetime.dig_digs == nil then M.settings_ref.lifetime.dig_digs = T{ 0 }; end
     M.settings_ref.lifetime.break_only[1] = M.lifetime_break_only or 0;
+    M.settings_ref.lifetime.dig_wins[1] = M.lifetime_dig_wins or 0;
+    M.settings_ref.lifetime.dig_digs[1] = M.lifetime_dig_digs or 0;
+    for _, k in ipairs({ 'moon_new_sw', 'moon_new_up', 'moon_full_sw',
+                         'moon_full_up', 'moon_norm_sw', 'moon_norm_up' }) do
+        if M.settings_ref.lifetime[k] == nil then
+            M.settings_ref.lifetime[k] = T{ 0 };
+        end
+        M.settings_ref.lifetime[k][1] = M['lifetime_' .. k] or 0;
+    end
+end
+
+--- Which of the three moon buckets we are in right now. Uses the game's own
+--- phase name rather than a percentage cut-off of our own, so "New" and
+--- "Full" mean exactly what the moon readout on the panel says.
+local function moon_bucket()
+    local name = nil;
+    pcall(function ()
+        local m = vana.get_moon(vana.get_timestamp());
+        name = m and m.name or nil;
+    end);
+    if name == 'New Moon' then
+        return 'new';
+    elseif name == 'Full Moon' then
+        return 'full';
+    end
+    return 'norm';
 end
 
 local function add_lifetime_outcome(oc)
+    -- Every counted swing is a chance at a skill-up, so this is the
+    -- denominator for the moon rates as well.
+    local b = moon_bucket();
+    M['lifetime_moon_' .. b .. '_sw'] = (tonumber(M['lifetime_moon_' .. b .. '_sw']) or 0) + 1;
     if oc == 'W' then
         M.lifetime_wins = (tonumber(M.lifetime_wins) or 0) + 1;
     elseif oc == 'M' then
@@ -1422,6 +2231,10 @@ local function add_lifetime_outcome(oc)
 end
 
 function M.add_lifetime_skill(oc)
+    do
+        local b = moon_bucket();
+        M['lifetime_moon_' .. b .. '_up'] = (tonumber(M['lifetime_moon_' .. b .. '_up']) or 0) + 1;
+    end
     if oc == 'W' then
         M.lifetime_skill_w = (tonumber(M.lifetime_skill_w) or 0) + 1;
     elseif oc == 'M' then
@@ -1596,6 +2409,60 @@ function M.touch_activity(act)
     s.last_activity_ms = now_ms();
 end
 
+----------------------------------------------------------------------
+-- Reacting to what you are doing
+--
+-- Two separate behaviours that were easy to confuse, because they always
+-- happened together:
+--
+--   SWITCHING   the tab follows the activity, so mining then digging puts
+--               you on the Dig tab without clicking.
+--   REVEALING   the panel un-hides itself when an activity starts.
+--
+-- Babs asked for the second one to be optional - "can you make a toggle so
+-- it doesn't automatically pop up when you go to mine". Someone who keeps
+-- the panel hidden and glances at it on purpose does not want it appearing
+-- over the game every time they swing.
+--
+-- They are separate settings because they are separate wants: following the
+-- activity is useful even if you never want the window forced open. Both
+-- default ON, which is exactly how Floos behaved before, so nobody's setup
+-- changes until they choose to change it.
+--
+-- These are the only places the auto behaviour happens. Nine call sites
+-- used to assign M.active_tab directly and five forced the panel visible;
+-- routing them through here is what makes one toggle actually cover all of
+-- it, rather than covering most of it and leaving a surprise.
+----------------------------------------------------------------------
+
+--- Follow the activity you are doing, if the player wants that.
+function M.auto_switch_to(act)
+    if act == nil then return; end
+    local s = M.settings_ref;
+    if s ~= nil and s.tracker ~= nil and s.tracker.auto_switch_tab ~= nil
+        and s.tracker.auto_switch_tab[1] == false then
+        return;
+    end
+    M.active_tab = act;
+end
+
+--- Show the panel because something happened, if the player wants that.
+function M.auto_reveal()
+    local s = M.settings_ref;
+    if s == nil then return; end
+    if s.tracker ~= nil and s.tracker.auto_show ~= nil
+        and s.tracker.auto_show[1] == false then
+        return;
+    end
+    if s.tracker ~= nil and s.tracker.visible ~= nil
+        and s.tracker.visible[1] == false then
+        s.tracker.visible[1] = true;
+    end
+    if s.panels_hidden ~= nil then
+        s.panels_hidden[1] = false;
+    end
+end
+
 function M.update_session_timer(act)
     act = act or M.active_tab;
     local s = sess(act);
@@ -1674,6 +2541,9 @@ function M.persist_session()
         snap.swings[1] = s.swings;
         snap.breaks[1] = s.breaks;
         snap.items[1] = s.items;
+        -- Added after the fact, so older snapshots will not have it.
+        if snap.wasted == nil then snap.wasted = T{ 0 }; end
+        snap.wasted[1] = s.wasted or 0;
         snap.skill_gain[1] = s.skill_gain;
         if snap.skill_w == nil then snap.skill_w = T{ 0 }; end
         if snap.skill_m == nil then snap.skill_m = T{ 0 }; end
@@ -1744,6 +2614,7 @@ function M.restore_session()
                 s.swings = (snap.swings and snap.swings[1]) or 0;
                 s.breaks = (snap.breaks and snap.breaks[1]) or 0;
                 s.items = (snap.items and snap.items[1]) or 0;
+                s.wasted = (snap.wasted and snap.wasted[1]) or 0;
                 s.skill_gain = (snap.skill_gain and snap.skill_gain[1]) or 0;
                 s.skill_w = (snap.skill_w and snap.skill_w[1]) or 0;
                 s.skill_m = (snap.skill_m and snap.skill_m[1]) or 0;
@@ -1807,13 +2678,39 @@ local function carry_daily(a, fresh)
     return fresh;
 end
 
-function M.reset_session(act)
+--- Clear a session, or every session with 'all'.
+---
+---@param clear_zones boolean|nil  also zero the persistent per-zone fatigue
+---   counters. Opt-in rather than automatic: this function also runs on
+---   login when "reset on load" is set, and wiping the zone allowances every
+---   time you log in would destroy the one thing they exist to remember.
+---   The explicit user-facing clears pass true.
+-- The moment you last did something to the panel by hand - a clear, for
+-- now. The idle hide below treats it like a swing, because a panel that
+-- vanishes the instant you clear it looks like the clear closed it.
+M.woke_ms = 0;
+
+function M.reset_session(act, clear_zones)
+    M.woke_ms = now_ms();
     if act == nil or act == 'all' then
         for _, a in ipairs(ACTIVITIES) do
             M.sessions[a] = carry_daily(a, blank_session());
         end
     else
         M.sessions[act] = carry_daily(act, blank_session());
+    end
+
+    if clear_zones then
+        if act == nil or act == 'all' then
+            M.zone_fatigue_clear_all();
+        else
+            M.zone_fatigue_clear_act(act);
+        end
+        -- The global counter exists to be watched across zones, so a session
+        -- clear leaves it alone unless its protection is switched off.
+        if not M.global_fatigue_protected() then
+            M.global_fatigue_clear(act);
+        end
     end
 
     M.persist_session();
@@ -1829,6 +2726,13 @@ function M.pause_session(act)
         s.session_active = M.get_session_seconds(act);
         s.last_action = now_s();
     end
+end
+
+--- Hand-paused, as opposed to gone-idle. The panel and the slash command
+--- both need to tell those apart; is_session_paused_idle deliberately does
+--- not, because for timing purposes they are the same stopped clock.
+function M.is_session_hand_paused(act)
+    return sess(act or M.active_tab).paused == true;
 end
 
 function M.resume_session(act)
@@ -1853,6 +2757,40 @@ function M.tick_autosave()
     settings_lib.save();
     M.session_dirty = false;
     M.session_last_save_ms = now_ms();
+end
+
+--- True while a clamming cooldown is running that we still owe a ding for.
+--- The ding fires on the transition from waiting to ready, so exactly once
+--- per cooldown rather than every frame afterwards.
+M.clam_cd_armed = false;
+
+--- Time-based alerts. Called every frame from the present handler, ahead of
+--- the panel gate on purpose: the clamming cooldown ends whether or not the
+--- panel is on screen, whether the clam tab is the one showing, and whether
+--- a game menu is covering everything. A ding you only get while looking at
+--- the right tab is not a timer, it is a decoration.
+---@param settings table
+function M.tick_alerts(settings)
+    if settings == nil then
+        return;
+    end
+
+    local s = M.sessions and M.sessions.clamming or nil;
+    if s == nil or (tonumber(s.last_find_s) or 0) <= 0 then
+        M.clam_cd_armed = false;
+        return;
+    end
+
+    local delay = (settings.clamming and settings.clamming.dig_delay
+        and settings.clamming.dig_delay[1]) or constants.CLAM_POINT_RESPAWN or 10;
+    local _, ready = M.clam_cooldown(s.last_find_s, now_s(), delay);
+
+    if not ready then
+        M.clam_cd_armed = true;
+    elseif M.clam_cd_armed then
+        M.clam_cd_armed = false;
+        sound.event(settings, 'clam_ready');
+    end
 end
 
 function M.get_accuracy(act)
@@ -2127,6 +3065,15 @@ local function fatigue_cap(settings, act)
     return 200;
 end
 
+--- The cap for an activity, for callers outside this file (the config's
+--- zone-fatigue list). Reads the bound settings.
+function M.fatigue_cap_for(act)
+    if M.settings_ref == nil then return nil; end
+    local ok, cap = pcall(fatigue_cap, M.settings_ref, act);
+    if ok then return tonumber(cap); end
+    return nil;
+end
+
 ------------------------------------------------------------------------
 -- Clamming: how dangerous is one more dig?
 --
@@ -2207,6 +3154,57 @@ function M.clam_risk(weight, capacity, hq_body)
         capacity = capacity,
         weight = weight,
     };
+end
+
+--- Colour tier for the BUCKET METER specifically.
+---
+--- Reported by Virhe: on a 200 pz bucket the meter turned yellow at 160
+--- instead of 180. He was right about why - the thresholds were hardcoded
+--- fractions, 0.8 and 0.95, which only produce a sensible margin on the
+--- 100 pz bucket. What actually bursts a bucket is not how full it is as a
+--- percentage but whether the NEXT item fits, and clam items weigh a fixed
+--- number of ponzes no matter what you are carrying them in. So the honest
+--- threshold is headroom, and this reads it off the real weight table.
+---
+--- WHY NOT JUST USE clam_risk's TIER
+--- ---------------------------------
+--- Because the 200 pz bucket carries a flat 10% "something breaks it"
+--- hazard that has nothing to do with fullness, which puts clam_risk into
+--- 'risky' from the moment the bucket is empty. Colouring a FULLNESS meter
+--- by that would paint the 200 bucket orange permanently, which is worse
+--- than the bug being fixed. Only the overflow half belongs on this meter;
+--- the incident half is already on the risk line underneath it.
+---
+--- The thresholds fall out of the item data rather than being chosen:
+--- the heaviest clam item is 20 pz, so below 20 headroom something can no
+--- longer fit, and at 5 headroom four fifths of all finds burst you.
+---@return string tier   'safe' | 'watch' | 'risky' | 'stop'
+---@return number pct    chance the next find is too heavy, 0-100
+function M.clam_fill_tier(weight, capacity)
+    weight = tonumber(weight) or 0;
+    capacity = tonumber(capacity) or (constants.CLAM_START_CAPACITY or 50);
+    local headroom = capacity - weight;
+    if headroom < 0 then headroom = 0; end
+
+    local overflow = 0;
+    for name, pct in pairs(constants.CLAM_ABUNDANCE or {}) do
+        if clam_weight_of(name) > headroom then
+            overflow = overflow + pct;
+        end
+    end
+    if overflow > 100 then overflow = 100; end
+
+    local tier;
+    if overflow <= 0.001 then
+        tier = 'safe';
+    elseif overflow < 5 then
+        tier = 'watch';
+    elseif overflow < 20 then
+        tier = 'risky';
+    else
+        tier = 'stop';
+    end
+    return tier, overflow;
 end
 
 --- Seconds until this clamming point is ready again, and whether it is.
@@ -2549,7 +3547,7 @@ function M.handle_action_packet(e)
     debug_note('action', act .. ' attempt sent');
 
     local s = sess(act);
-    M.active_tab = act;
+    M.auto_switch_to(act);
     M.update_session_timer(act);
     M.touch_activity(act);
 
@@ -2566,14 +3564,7 @@ function M.handle_action_packet(e)
     end
 
     M.session_dirty = true;
-    if M.settings_ref ~= nil then
-        if M.settings_ref.tracker.visible[1] == false then
-            M.settings_ref.tracker.visible[1] = true;
-        end
-        if M.settings_ref.panels_hidden ~= nil then
-            M.settings_ref.panels_hidden[1] = false;
-        end
-    end
+    M.auto_reveal();
 end
 
 --- Incoming packets. Only weather so far, and only two ids, so this stays
@@ -2635,19 +3626,46 @@ function M.handle_packet_out(e)
 
     M.awaiting = act;
     M.awaiting_ms = now_ms();
-    M.active_tab = act; -- auto-switch tab to the activity you're doing
+    M.auto_switch_to(act);
     M.update_session_timer(act);
     M.touch_activity(act);
-    if M.settings_ref ~= nil and M.settings_ref.tracker.visible[1] == false then
-        M.settings_ref.tracker.visible[1] = true;
-    end
-    if M.settings_ref ~= nil and M.settings_ref.panels_hidden ~= nil then
-        M.settings_ref.panels_hidden[1] = false;
-    end
+    M.auto_reveal();
 end
 
 function M.handle_text(e, pricing)
     local message = string.lower(string.strip_colors(e.message or ''));
+
+    -- "Your mining rank has increased to Recruit."
+    -- Matched loosely on the skill word so it works for every HELM activity
+    -- without a second table to keep in step with SKILL_LINES.
+    do
+        local word, rank = string.match(message,
+            'your ([%a%s]+) rank has increased to ([%a%s]+)');
+        if word ~= nil and rank ~= nil then
+            rank = rank:gsub('[%.%s]+$', '');
+            local act = nil;
+            for _, sk in ipairs(SKILL_LINES) do
+                for _, w in ipairs(sk.words) do
+                    if string.find(word, w, 1, true) ~= nil then
+                        act = sk.act;
+                        break;
+                    end
+                end
+                if act ~= nil then break; end
+            end
+            M.rank_toast = {
+                at_ms = now_ms(),
+                act = act,
+                rank = rank,
+            };
+            -- The rank is the bigger news; the skill-up side below stays
+            -- silent on a rank-crossing gain so this is never the one the
+            -- throttle swallows.
+            sound.event(M.settings_ref, 'rank_up');
+            debug_note('rank', (act or '?') .. ' -> ' .. rank);
+        end
+    end
+
 
     -- Skill-ups (independent of awaiting). Handled generically so every HELM
     -- skill is treated the same, and tolerant of the comma the game puts
@@ -2666,6 +3684,18 @@ function M.handle_text(e, pricing)
             end
             M.session_dirty = true;
             M.touch_activity(sk.act);
+
+            -- Ranks land every 10.0 - 10, 20, 30, 40, 50, 60 - and the rank
+            -- alert covers those. Staying quiet here means the rank sound
+            -- has the moment to itself instead of doubling up.
+            if level ~= nil and level > 0 then
+                local before = level - gain;
+                local rank_crossing =
+                    math.floor((level + 0.0001) / 10) > math.floor((before + 0.0001) / 10);
+                if not rank_crossing then
+                    sound.event(M.settings_ref, 'skill_up');
+                end
+            end
         end
     end
 
@@ -2694,15 +3724,8 @@ function M.handle_text(e, pricing)
             M.update_session_timer(target_act);
             M.touch_activity(target_act);
             M.session_dirty = true;
-            M.active_tab = target_act;
-            if M.settings_ref ~= nil then
-                if M.settings_ref.tracker.visible[1] == false then
-                    M.settings_ref.tracker.visible[1] = true;
-                end
-                if M.settings_ref.panels_hidden ~= nil then
-                    M.settings_ref.panels_hidden[1] = false;
-                end
-            end
+            M.auto_switch_to(target_act);
+            M.auto_reveal();
         end
     end
 
@@ -2729,7 +3752,7 @@ function M.handle_text(e, pricing)
             elseif hook == 'monster' then
                 fs.monsters = (fs.monsters or 0) + 1;
             end
-            M.active_tab = 'fishing';
+            M.auto_switch_to('fishing');
             M.update_session_timer('fishing');
             M.touch_activity('fishing');
             M.session_dirty = true;
@@ -2765,7 +3788,7 @@ function M.handle_text(e, pricing)
                 push_history(fs, 'M');
                 set_outcome(fs, 'M');
             end
-            M.active_tab = 'fishing';
+            M.auto_switch_to('fishing');
             M.touch_activity('fishing');
             M.session_dirty = true;
             debug_note('fish', 'lost: ' .. fail);
@@ -2789,9 +3812,12 @@ function M.handle_text(e, pricing)
                 if (unit * qty) >= BIG_DROP_GIL then
                     fs.big_flash_ms = now_ms();
                 end
+                if (unit * qty) >= drop_sound_gil(M.settings_ref) then
+                    sound.event(M.settings_ref, 'big_drop');
+                end
                 push_history(fs, 'W');
                 set_outcome(fs, 'W');
-                M.zone_record_swing('fishing', unit * qty, true, false, false);
+                M.zone_record_swing('fishing', unit * qty, true, false, false, name, qty);
                 journal.write({
                     t = os.time(), act = 'fishing', outcome = 'W',
                     item = name, qty = qty, gil = unit * qty,
@@ -2801,7 +3827,7 @@ function M.handle_text(e, pricing)
                 });
                 debug_note('fish', 'caught ' .. name .. ' x' .. qty);
             end
-            M.active_tab = 'fishing';
+            M.auto_switch_to('fishing');
             M.update_session_timer('fishing');
             M.touch_activity('fishing');
             M.session_dirty = true;
@@ -2820,13 +3846,11 @@ function M.handle_text(e, pricing)
         local cs = M.sessions.clamming;
 
         local function clam_touch()
-            M.active_tab = 'clamming';
+            M.auto_switch_to('clamming');
             M.update_session_timer('clamming');
             M.touch_activity('clamming');
             M.session_dirty = true;
-            if M.settings_ref ~= nil and M.settings_ref.tracker.visible[1] == false then
-                M.settings_ref.tracker.visible[1] = true;
-            end
+            M.auto_reveal();
         end
 
         --- Everything in the bucket is gone. Which of the two ways it went
@@ -2873,6 +3897,10 @@ function M.handle_text(e, pricing)
                 cs.last_find_s = now_s();
                 push_history(cs, 'W');
                 set_outcome(cs, 'W');
+                -- Per-item, per-zone tally. Bibiki Bay is the only clamming
+                -- zone today, but recording the zone anyway costs nothing
+                -- and means the report needs no special case.
+                M.zone_record_swing('clamming', 0, true, false, false, name);
                 clam_touch();
             end
         end
@@ -2977,7 +4005,8 @@ function M.handle_text(e, pricing)
         if string.find(message, 'you dig and you dig', 1, true) ~= nil then
             push_history(ds, 'M');
             set_outcome(ds, 'M');
-            M.active_tab = 'digging';
+            M.add_lifetime_dig(false);
+            M.auto_switch_to('digging');
             M.update_session_timer('digging');
             M.touch_activity('digging');
             M.session_dirty = true;
@@ -2999,12 +4028,16 @@ function M.handle_text(e, pricing)
             if unit >= BIG_DROP_GIL then
                 ds.big_flash_ms = now_ms();
             end
+            if unit >= drop_sound_gil(M.settings_ref) then
+                sound.event(M.settings_ref, 'big_drop');
+            end
             push_history(ds, 'W');
             set_outcome(ds, 'W');
-            M.active_tab = 'digging';
+            M.add_lifetime_dig(true);
+            M.auto_switch_to('digging');
             M.update_session_timer('digging');
             M.touch_activity('digging');
-            M.zone_record_swing('digging', unit, true, false, false);
+            M.zone_record_swing('digging', unit, true, false, false, name);
             journal.write({
                 t = os.time(), act = 'digging', outcome = 'W',
                 item = name, qty = 1, gil = unit,
@@ -3072,10 +4105,14 @@ function M.handle_text(e, pricing)
                 else
                     hs.rewards[item_name] = hs.rewards[item_name] + 1;
                 end
+                local unit = 0;
                 if pricing ~= nil then
-                    local unit = tonumber(pricing[normalize_key(item_name)]) or 0;
+                    unit = tonumber(pricing[normalize_key(item_name)]) or 0;
                     M.add_lifetime_gil(unit);
                 end
+                -- Drops and steals both come through here, so hunting gets
+                -- the same per-item breakdown as everything else.
+                M.zone_record_swing('hunting', unit, true, false, false, item_name);
             end
 
             if hitem then
@@ -3110,14 +4147,7 @@ function M.handle_text(e, pricing)
                 M.update_session_timer('hunting');
                 M.touch_activity('hunting');
                 M.session_dirty = true;
-                if M.settings_ref ~= nil then
-                    if M.settings_ref.tracker.visible[1] == false then
-                        M.settings_ref.tracker.visible[1] = true;
-                    end
-                    if M.settings_ref.panels_hidden ~= nil then
-                        M.settings_ref.panels_hidden[1] = false;
-                    end
-                end
+                M.auto_reveal();
             end
         end
         return; -- hunt tab owns text handling while selected
@@ -3173,6 +4203,41 @@ function M.handle_text(e, pricing)
         end
     end
 
+    ------------------------------------------------------------------
+    -- A swing that charged the allowance and gave nothing back.
+    --
+    -- Handled on its own and deliberately narrow: it moves the fatigue
+    -- count and NOTHING else. The "unable to log anything" line that
+    -- follows a moment later owns the swing, the history entry, the
+    -- outcome tag and the journal row, exactly as it always has - so
+    -- M.awaiting is left alone here on purpose. Clearing it would eat
+    -- that second line and turn one swing into none.
+    ------------------------------------------------------------------
+    if rule ~= nil and rule.wasted ~= nil and not (success or broke or unable) then
+        for _, pat in ipairs(rule.wasted) do
+            if string.match(message, pat) then
+                local ws = sess(act);
+                M.update_session_timer(act);
+                M.touch_activity(act);
+                -- Check before the increment, same as the success path: the
+                -- cap is about what was already banked.
+                local capped = note_reset_if_capped(act,
+                    fatigue_cap(M.settings_ref or {}, act));
+                ws.items = (ws.items or 0) + 1;
+                ws.wasted = (ws.wasted or 0) + 1;
+                learn_fatigue_cap(M.settings_ref, act, ws.items);
+                debug_note('result', act .. ' -> wasted (fatigue spent, no item)');
+                if capped then
+                    print(chat.header(addon.name):append(chat.message(string.format(
+                        'Fatigue reset detected. Schedule confidence: %s.',
+                        M.fatigue_confidence()
+                    ))));
+                end
+                return;
+            end
+        end
+    end
+
     if not (success or broke or unable) then
         return;
     end
@@ -3194,7 +4259,22 @@ function M.handle_text(e, pricing)
         -- Check before the increment: the cap is about the items already banked.
         reset_seen = note_reset_if_capped(act, fatigue_cap(M.settings_ref or {}, act));
         s.items = (s.items or 0) + 1;
-        learn_fatigue_cap(M.settings_ref, act, s.items);
+        zf_bump(act);
+        gf_bump(act);
+        -- Whichever counter the panel is showing is the one the cap sound
+        -- and cap-learning follow.
+        local shown_items = M.fatigue_items(act);
+        learn_fatigue_cap(M.settings_ref, act, shown_items);
+
+        -- The swing that lands you on the cap. Equality rather than >= so it
+        -- fires exactly once instead of on every swing afterwards; items only
+        -- ever climb by one here, so it cannot be stepped over.
+        do
+            local fcap = fatigue_cap(M.settings_ref or {}, act);
+            if fcap ~= nil and fcap > 0 and shown_items == fcap then
+                sound.event(M.settings_ref, 'fatigue_cap');
+            end
+        end
         if s.rewards[success] == nil then
             s.rewards[success] = 1;
         else
@@ -3205,6 +4285,9 @@ function M.handle_text(e, pricing)
             M.add_lifetime_gil(swing_gil);
             if swing_gil >= BIG_DROP_GIL then
                 s.big_flash_ms = now_ms();
+            end
+            if swing_gil >= drop_sound_gil(M.settings_ref) then
+                sound.event(M.settings_ref, 'big_drop');
             end
         end
     end
@@ -3222,7 +4305,8 @@ function M.handle_text(e, pricing)
             net_swing = net_swing - tool_cost(M.settings_ref, act);
         end
         M.zone_record_swing(act, net_swing,
-            (success ~= nil and success ~= ''), broke ~= nil, unable ~= nil);
+            (success ~= nil and success ~= ''), broke ~= nil, unable ~= nil,
+            success);
     end
 
     -- History entry first so a flushed pending skill-up marks this swing,
@@ -3287,6 +4371,11 @@ function M.build_report(settings, pricing)
         .. (M.is_session_paused_idle(act) and ' (paused)' or ''));
     lines:append(SWING_LABEL[act] .. ': ' .. format.format_int(s.swings));
     lines:append('Items: ' .. format.format_int(s.items));
+    if act == 'logging' and (s.wasted or 0) > 0 then
+        -- Called out separately because it is the one number Items hides:
+        -- these charged the allowance and produced nothing to show for it.
+        lines:append('Rotting Timber: ' .. format.format_int(s.wasted));
+    end
     lines:append('Breaks: ' .. format.format_int(s.breaks));
     lines:append('Accuracy: ' .. format.format_percent(M.get_accuracy(act)));
     local sk = skill_value(settings, act);
@@ -3694,19 +4783,6 @@ function M.min_panel_height(act)
     return h;
 end
 
---- Read an optional settings.ui flag without exploding on old configs.
-local function ui_flag(settings, key, fallback)
-    local u = settings ~= nil and settings.ui or nil;
-    if u == nil or u[key] == nil then
-        return fallback;
-    end
-    local v = u[key][1];
-    if v == nil then
-        return fallback;
-    end
-    return v;
-end
-
 local function accent_of(act, settings)
     return theme.accent_for(act, ui_flag(settings, 'accent_by_activity', true));
 end
@@ -3922,36 +4998,99 @@ local function draw_outcome_strip(s, content_left, content_w, accent)
 end
 
 --- Rolling gil/hr sparkline built from the session samples.
-local function draw_rate_spark(s, content_left, content_w, accent)
-    local samples = s.samples or {};
-    if #samples < 3 then
-        return false;
-    end
-
-    local series = {};
-    for i = 2, #samples do
-        local dt = (samples[i].t or 0) - (samples[i - 1].t or 0);
-        local dg = (samples[i].worth or 0) - (samples[i - 1].worth or 0);
-        if dt > 0 then
-            series[#series + 1] = (dg / dt) * 3600;
-        end
-    end
-    if #series < 2 then
-        return false;
-    end
-
-    local h = math.max(10, math.floor(line_h() * 0.9 + 0.5));
-    imgui.SetCursorPosX(content_left);
-    local sx, sy = screen_xy();
-    vis.spark(draw_list(), sx, sy + 1, content_w, h, series, accent, 0.16);
-    imgui.Dummy({ content_w, h + 3 });
-    return true;
-end
-
 -- Fixed-width right columns so every row lines up while resizing:
 -- [ name .................. ][ xN ][ pct ][ gil ]
 -- A share bar sits behind the row so the list doubles as a chart.
-local function draw_reward_row(name, count, worth, content_left, content_w, is_best, total_items, accent, max_worth)
+--- Write one item's unit price straight into the price list and reload it.
+--- config is pulled in lazily because config already requires the tracker the
+--- same way; taking it at the top of the file would close the loop.
+local function set_item_price(name, price)
+    price = math.floor(tonumber(price) or 0);
+    if price < 0 then price = 0; end
+    local ok = pcall(function ()
+        local cfg = require('config');
+        cfg.merge_prices({ tostring(name) .. ':' .. tostring(price) });
+    end);
+    if ok then
+        settings_lib.save();
+    end
+    return ok;
+end
+
+--- Column geometry for the haul. Shared by the caption row and every item
+--- row, so a label can never drift out of line with the numbers under it.
+---
+--- Each column is at least as wide as a reference string ('000,000g' and
+--- friends), which is what keeps the columns steady from row to row instead
+--- of jittering with each value's own width. Passing no value strings gives
+--- the reference-width layout, which is what the caption row wants.
+local function reward_cols(content_left, content_w, marker_w, count_str, pct_str, unit_str, gil_str)
+    local gap = 8;
+    local gil_col_w = math.max(text_w('000,000g'), text_w(gil_str or ''));
+    local pct_col_w = math.max(text_w('100.0%'), text_w(pct_str or ''));
+    local count_col_w = math.max(text_w('x999'), text_w(count_str or ''));
+    local unit_col_w = math.max(text_w('000,000'), text_w(unit_str or ''));
+
+    local name_left = content_left + (marker_w or 0);
+    local gil_right = content_left + content_w;
+    local unit_right = gil_right - gil_col_w - gap;
+
+    -- The unit price is the column that goes when the panel is narrow. It is
+    -- the one number you can work out from the other two, and losing it costs
+    -- less than chopping every item name in half. Editing still works from
+    -- the config window when it is hidden.
+    local show_unit = ((unit_right - unit_col_w - gap - pct_col_w - gap
+        - count_col_w - gap) - name_left) >= 70;
+
+    local pct_right = show_unit and (unit_right - unit_col_w - gap)
+        or (gil_right - gil_col_w - gap);
+    local count_right = pct_right - pct_col_w - gap;
+    local name_max = (count_right - count_col_w - gap) - name_left;
+    if name_max < 20 then name_max = 20; end
+
+    return {
+        name_left = name_left,
+        name_max = name_max,
+        count_right = count_right,
+        pct_right = pct_right,
+        unit_right = unit_right,
+        unit_col_w = unit_col_w,
+        gil_right = gil_right,
+        show_unit = show_unit,
+    };
+end
+
+--- Column captions above the haul list. Muted on purpose: this is a legend,
+--- not data, and it should not compete with the numbers underneath.
+local function draw_reward_header(content_left, content_w)
+    local muted = theme.colors.text_dim or theme.colors.text_light;
+    local col = vis.alpha(muted, 0.70);
+    local c = reward_cols(content_left, content_w, 0);
+    local row_y = num_or(imgui.GetCursorPosY(), 0);
+
+    imgui.SetCursorPosX(c.name_left);
+    imgui.SetCursorPosY(row_y);
+    ui.text_outlined_colored('Item', col);
+
+    -- Right-aligned to each column's edge, exactly like the values. A caption
+    -- wider than its column simply reaches left into the gap, which is empty.
+    local function cap(label, right_x)
+        local w = text_w(label);
+        imgui.SameLine(0, 0);
+        imgui.SetCursorPosY(row_y);
+        imgui.SetCursorPosX(math.max(content_left, right_x - w));
+        ui.text_outlined_colored(label, col);
+    end
+
+    cap('Quantity', c.count_right);
+    cap('%', c.pct_right);
+    if c.show_unit then
+        cap('Per unit', c.unit_right);
+    end
+    cap('Total', c.gil_right);
+end
+
+local function draw_reward_row(name, count, worth, content_left, content_w, is_best, total_items, accent, max_worth, unit)
     local muted = theme.colors.text_dim or theme.colors.text_light;
     local light = theme.colors.text_light;
     local row_y = num_or(imgui.GetCursorPosY(), 0);
@@ -3975,9 +5114,13 @@ local function draw_reward_row(name, count, worth, content_left, content_w, is_b
         share = count / total_items;
     end
 
+    unit = tonumber(unit) or 0;
     local count_str = string.format('x%d', count);
     local pct_str = string.format('%.1f%%', pct);
     local gil_str = format.format_int(worth) .. 'g';
+    local unit_str = (unit > 0) and format.format_int(unit) or '--';
+    local key = normalize_key(name);
+    local editing = (M.price_edit ~= nil and M.price_edit.key == key);
 
     -- Row background bar (drawn first so text lands on top).
     imgui.SetCursorPosX(content_left);
@@ -3993,19 +5136,16 @@ local function draw_reward_row(name, count, worth, content_left, content_w, is_b
         vis.diamond(draw_list(), sx + (marker_w * 0.4), sy + (bar_h * 0.5), marker_w * 0.36, accent);
     end
 
-    local gap = 8;
-    local gil_col_w = math.max(text_w('000,000g'), text_w(gil_str));
-    local pct_col_w = math.max(text_w('100.0%'), text_w(pct_str));
-    local count_col_w = math.max(text_w('x999'), text_w(count_str));
-
-    local right = content_left + content_w;
-    local gil_right = right;
-    local pct_right = gil_right - gil_col_w - gap;
-    local count_right = pct_right - pct_col_w - gap;
-    local name_left = content_left + marker_w;
-    local name_max = (count_right - count_col_w - gap) - name_left;
-    if name_max < 20 then name_max = 20; end
-    local display_name = truncate_to_width(title_case(name), name_max);
+    local c = reward_cols(content_left, content_w, marker_w,
+        count_str, pct_str, unit_str, gil_str);
+    local name_left = c.name_left;
+    local count_right = c.count_right;
+    local pct_right = c.pct_right;
+    local unit_right = c.unit_right;
+    local unit_col_w = c.unit_col_w;
+    local gil_right = c.gil_right;
+    local show_unit = c.show_unit;
+    local display_name = truncate_to_width(title_case(name), c.name_max);
 
     -- Worthless drops stay visible but recede.
     local dim = (worth <= 0) and 0.62 or 1.0;
@@ -4028,6 +5168,77 @@ local function draw_reward_row(name, count, worth, content_left, content_w, is_b
     imgui.SetCursorPosY(row_y);
     imgui.SetCursorPosX(math.max(content_left, pct_right - pw));
     ui.text_outlined_colored(pct_str, mid_c);
+
+    ------------------------------------------------------------------
+    -- Unit price. Click it to retype it without opening the config.
+    --
+    -- Drawn as plain text with a hit-test over the cell rather than as a
+    -- button, because every other cell on this row is hand-positioned text
+    -- and a real widget here would not line up with them.
+    ------------------------------------------------------------------
+    if show_unit then
+        local cell_x1 = sx + (unit_right - unit_col_w - content_left);
+        local cell_x2 = sx + (unit_right - content_left);
+
+        if editing then
+            imgui.SameLine(0, 0);
+            imgui.SetCursorPosY(row_y - 2);
+            imgui.SetCursorPosX(math.max(content_left, unit_right - unit_col_w));
+            imgui.SetNextItemWidth(unit_col_w);
+            if M.price_edit.focus then
+                M.price_edit.focus = false;
+                pcall(function () imgui.SetKeyboardFocusHere(); end);
+            end
+
+            local enter_flag = ImGuiInputTextFlags_EnterReturnsTrue or 32;
+            local committed = false;
+            pcall(function ()
+                committed = imgui.InputText('##price_' .. key,
+                    M.price_edit.buf, 12, enter_flag);
+            end);
+
+            if committed then
+                set_item_price(name, tonumber(M.price_edit.buf[1]) or 0);
+                M.price_edit = nil;
+            else
+                -- Clicking away closes without writing, so a half-typed
+                -- number never lands in the price list by accident.
+                local gone = false;
+                pcall(function () gone = imgui.IsItemDeactivated(); end);
+                if gone then
+                    M.price_edit = nil;
+                end
+            end
+        else
+            local hovered = false;
+            pcall(function ()
+                hovered = imgui.IsMouseHoveringRect(
+                    { cell_x1 - 3, sy - 1 }, { cell_x2 + 3, sy + bar_h + 1 });
+            end);
+            if hovered then
+                -- A faint plate is the whole affordance: it says "this one
+                -- is clickable" without putting a button on every row.
+                vis.rect(draw_list(), cell_x1 - 3, sy - 1,
+                    (cell_x2 - cell_x1) + 6, bar_h + 2, vis.alpha(accent, 0.22), 2);
+                local clicked = false;
+                pcall(function () clicked = imgui.IsMouseClicked(0); end);
+                if clicked then
+                    M.price_edit = {
+                        key = key,
+                        buf = { (unit > 0) and tostring(math.floor(unit)) or '' },
+                        focus = true,
+                    };
+                end
+            end
+
+            local uw = text_w(unit_str);
+            imgui.SameLine(0, 0);
+            imgui.SetCursorPosY(row_y);
+            imgui.SetCursorPosX(math.max(content_left, unit_right - uw));
+            ui.text_outlined_colored(unit_str,
+                (unit > 0) and mid_c or vis.alpha(muted, 0.45));
+        end
+    end
 
     local gw = text_w(gil_str);
     imgui.SameLine(0, 0);
@@ -4133,6 +5344,242 @@ end
 
 --- Hero row: identity + skill on the left, the number you actually watch on
 --- the right, at 1.5x. Flashes on a skill-up.
+----------------------------------------------------------------------
+-- Tiles and the rate chart
+--
+-- Two things the panel was missing. Facts about where you are standing -
+-- clock, moon, day, weather - were joined with pipes into one line that
+-- clipped from the right, so the last fact was the one you never saw.
+-- And the rate history was a sparkline the height of a row, which is a
+-- decoration rather than a chart.
+----------------------------------------------------------------------
+
+--- A row of equal-width tiles: a small caps label over a value, on a faint
+--- cell. Each tile truncates on its own, so a long moon phase costs you a
+--- few letters of "Last Quarter" rather than the whole weather field.
+---
+--- tiles: { { label, value, color, on_click }, ... }
+--- on_click makes the tile a button: it highlights on hover and fires.
+local function draw_tiles(tiles, content_left, content_w, accent, transparent)
+    local n = #tiles;
+    if n == 0 then return; end
+
+    local dl = draw_list();
+    local muted = theme.colors.text_dim or theme.colors.text_light;
+    local light = theme.colors.text_light;
+
+    local gap = 4;
+    local cell_w = math.floor((content_w - (gap * (n - 1))) / n);
+    if cell_w < 36 then cell_w = 36; end
+    local lh = line_h();
+    local pad_y = 3;
+    local pad_x = 5;
+    -- The label is drawn smaller, so the two lines sit closer than 2 * lh.
+    local cell_h = math.floor(lh * 1.75 + 0.5) + (pad_y * 2);
+
+    local row_y = num_or(imgui.GetCursorPosY(), 0);
+    imgui.SetCursorPosX(content_left);
+    imgui.SetCursorPosY(row_y);
+    local sx, sy = screen_xy();
+
+    for i, t in ipairs(tiles) do
+        local x = sx + ((i - 1) * (cell_w + gap));
+        local cx = content_left + ((i - 1) * (cell_w + gap));
+
+        local hovered = false;
+        if t.on_click ~= nil then
+            pcall(function ()
+                hovered = imgui.IsMouseHoveringRect({ x, sy }, { x + cell_w, sy + cell_h });
+            end);
+        end
+
+        if not transparent or hovered then
+            vis.rect(dl, x, sy, cell_w, cell_h,
+                vis.alpha(accent, hovered and 0.18 or 0.06), 3);
+        end
+        if hovered then
+            local clicked = false;
+            pcall(function () clicked = imgui.IsMouseClicked(0); end);
+            if clicked then t.on_click(); end
+        end
+
+        -- Label: small caps, muted. The scale is popped before the value so
+        -- the value is measured and cut at its real size.
+        local ltag = fonts.push_scale(0.80);
+        local lab = truncate_to_width(string.upper(tostring(t.label or '')), cell_w - (pad_x * 2));
+        imgui.SetCursorPosX(cx + pad_x);
+        imgui.SetCursorPosY(row_y + pad_y);
+        ui.text_outlined_colored(lab, vis.alpha(muted, 0.80));
+        fonts.pop_scale(ltag);
+
+        local val = truncate_to_width(tostring(t.value or ''), cell_w - (pad_x * 2));
+        imgui.SameLine(0, 0);
+        imgui.SetCursorPosX(cx + pad_x);
+        imgui.SetCursorPosY(row_y + pad_y + math.floor(lh * 0.78 + 0.5));
+        ui.text_outlined_colored(val, t.color or light);
+
+        if i < n then imgui.SameLine(0, 0); end
+    end
+
+    imgui.SetCursorPosY(row_y + cell_h + 4);
+    imgui.Dummy({ 0, 0 });
+end
+
+--- Initials of a phrase: "Last Quarter" -> "LQ". For a tile too narrow for
+--- the words but wide enough to say which quarter.
+local function initials(str)
+    local out = '';
+    for word in tostring(str or ''):gmatch('%S+') do
+        out = out .. string.upper(word:sub(1, 1));
+    end
+    return out;
+end
+
+--- The rate chart. A floor, faint quarter-lines, a gradient under the
+--- curve, the session average dashed across it, the peak marked, and the
+--- latest reading lit. The one picture that says whether the session is
+--- climbing, coasting, or has gone cold - without reading a number.
+---
+--- Returns true if it drew anything.
+local function draw_rate_chart(s, content_left, content_w, accent, gph, height)
+    local samples = s.samples or {};
+    if #samples < 3 then
+        return false;
+    end
+
+    -- Rate per sample interval.
+    local series, times = {}, {};
+    for i = 2, #samples do
+        local dt = (samples[i].t or 0) - (samples[i - 1].t or 0);
+        local dg = (samples[i].worth or 0) - (samples[i - 1].worth or 0);
+        if dt > 0 then
+            series[#series + 1] = math.max(0, (dg / dt) * 3600);
+            times[#times + 1] = samples[i].t or 0;
+        end
+    end
+    if #series < 2 then
+        return false;
+    end
+
+    -- A three-point smooth. One lucky swing is a spike the height of the
+    -- chart; smoothed, it is a rise. The trend is what this is for.
+    local n = #series;
+    local sm = {};
+    for i = 1, n do
+        local a = series[math.max(1, i - 1)];
+        local b = series[i];
+        local c = series[math.min(n, i + 1)];
+        sm[i] = (a + (b * 2) + c) / 4;
+    end
+
+    local dl = draw_list();
+    local muted = theme.colors.text_dim or theme.colors.text_light;
+    local light = theme.colors.text_light;
+    local gold = theme.colors.text_gold or accent;
+
+    local h = tonumber(height) or math.max(30, math.floor(line_h() * 3.2 + 0.5));
+    local row_y = num_or(imgui.GetCursorPosY(), 0);
+    imgui.SetCursorPosX(content_left);
+    imgui.SetCursorPosY(row_y);
+    local sx, sy = screen_xy();
+    local x0, y0, w = sx, sy + 1, content_w;
+
+    -- Vertical scale: zero to a little above the highest of the curve and
+    -- the session average, so neither is glued to the ceiling.
+    local hi = sm[1];
+    for i = 2, n do if sm[i] > hi then hi = sm[i]; end end
+    if gph ~= nil and gph > hi then hi = gph; end
+    if hi <= 0 then hi = 1; end
+    hi = hi * 1.10;
+
+    local step = w / (n - 1);
+    local function pt(i)
+        local t = sm[i] / hi;
+        if t > 1 then t = 1; end
+        return x0 + ((i - 1) * step), y0 + h - (t * h);
+    end
+
+    -- Floor and quarter-lines.
+    vis.rect(dl, x0, y0, w, h, vis.alpha(accent, 0.05), 3);
+    for _, g in ipairs({ 0.25, 0.5, 0.75 }) do
+        local gy = y0 + h - (g * h);
+        vis.line(dl, x0, gy, x0 + w, gy, vis.alpha(muted, 0.09), 1);
+    end
+
+    -- Area under the curve, fading to nothing at the floor.
+    local a_top = vis.alpha(accent, 0.30);
+    local a_bot = vis.alpha(accent, 0.02);
+    for i = 1, n - 1 do
+        local x1, y1 = pt(i);
+        local x2, y2 = pt(i + 1);
+        local top = math.min(y1, y2);
+        vis.vgrad_rect(dl, x1, top, math.max(1, x2 - x1), (y0 + h) - top, a_top, a_bot);
+    end
+
+    -- The curve.
+    for i = 1, n - 1 do
+        local x1, y1 = pt(i);
+        local x2, y2 = pt(i + 1);
+        vis.line(dl, x1, y1, x2, y2, accent, 1.6);
+    end
+
+    -- Session average, dashed, labelled at the right. Above the line means
+    -- the last few minutes beat the session; below means they did not.
+    if gph ~= nil and gph > 0 then
+        local ay = y0 + h - (math.min(gph, hi) / hi) * h;
+        vis.hdash(dl, x0, x0 + w, ay, vis.alpha(light, 0.40), 5, 4, 1);
+
+        local lab = 'avg ' .. format.format_int(gph);
+        local ltag = fonts.push_scale(0.80);
+        local lw = text_w(lab);
+        local ly = ay - math.floor(line_h() * 0.85);
+        if ly < y0 then ly = ay + 2; end
+        imgui.SameLine(0, 0);
+        imgui.SetCursorPosX(content_left + w - lw - 4);
+        imgui.SetCursorPosY(row_y + (ly - sy));
+        ui.text_outlined_colored(lab, vis.alpha(light, 0.75));
+        fonts.pop_scale(ltag);
+    end
+
+    -- The peak, in gold.
+    local pi, pv = 1, sm[1];
+    for i = 2, n do
+        if sm[i] > pv then pi, pv = i, sm[i]; end
+    end
+    local px, py = pt(pi);
+    vis.diamond(dl, px, py, 3, gold);
+
+    -- The latest reading, breathing. A slow pulse rather than a blink, and
+    -- it is the only animated thing on the chart, so the eye lands there.
+    local lx, ly = pt(n);
+    local pulse = 0.5 + (0.5 * math.abs(math.sin(os.clock() * 2.2)));
+    vis.dot(dl, lx, ly, 2.4 + (2.4 * pulse), vis.alpha(accent, 0.12 + (0.22 * (1 - pulse))));
+    vis.dot(dl, lx, ly, 2.4, accent);
+
+    -- Time axis: how far back the left edge reaches, and "now" on the right.
+    do
+        local span = (times[#times] or 0) - (times[1] or 0);
+        local mins = math.max(1, math.floor((span / 60) + 0.5));
+        local ltag = fonts.push_scale(0.75);
+        local left_lab = string.format('-%dm', mins);
+        local right_lab = 'now';
+        local ty = row_y + (h - math.floor(line_h() * 0.75)) - 1;
+        imgui.SameLine(0, 0);
+        imgui.SetCursorPosX(content_left + 4);
+        imgui.SetCursorPosY(ty);
+        ui.text_outlined_colored(left_lab, vis.alpha(muted, 0.55));
+        imgui.SameLine(0, 0);
+        imgui.SetCursorPosX(content_left + w - text_w(right_lab) - 4);
+        imgui.SetCursorPosY(ty);
+        ui.text_outlined_colored(right_lab, vis.alpha(muted, 0.55));
+        fonts.pop_scale(ltag);
+    end
+
+    imgui.SetCursorPosY(row_y + h + 5);
+    imgui.Dummy({ 0, 0 });
+    return true;
+end
+
 local function draw_hero(act, settings, s, session_secs, hero_value, hero_suffix, accent, content_left, content_w, hero_scale)
     local muted = theme.colors.text_dim or theme.colors.text_light;
     local light = theme.colors.text_light;
@@ -4233,6 +5680,45 @@ end
 
 --- Mini mode: the four things you actually act on while gathering.
 --- Rate, when to stop, whether you have tools, and what you have made.
+--[[
+    Global fatigue: the counter that follows you between zones. Its label
+    carries the home zone, because the number means nothing without
+    knowing which zone it belongs to - and whether you are standing in it
+    (climbing) or away from it (draining, marked with a v).
+
+    Drawn whenever the feature is on, even at zero, so the row does not
+    flicker in and out as the counter empties.
+--]]
+local function draw_global_meter(act, pad, content_w, accent, good, warn, bad)
+    if not global_fatigue_on(act) then return false; end
+    local g = M.global_fatigue_record(act);
+    local count = (g and g.count) or 0;
+    local gcap = M.fatigue_cap_for(act) or 200;
+    local gfill = math.min(1, count / math.max(1, gcap));
+    local at_home = (g ~= nil) and ((g.zone_id or 0) > 0) and ((g.zone_id or 0) == (M.zone_id or 0));
+    local home = (g ~= nil and (g.zone_id or 0) > 0) and tostring(g.zone_name or '?') or nil;
+
+    local glabel;
+    if home == nil then
+        glabel = 'Global';
+    else
+        if #home > 14 then home = home:sub(1, 13) .. '.'; end
+        glabel = string.format('Global  %s%s', home, at_home and '' or '  v');
+    end
+    local gvalue = string.format('%d%%  %d / %d', math.floor((gfill * 100) + 0.5), count, gcap);
+    if home == nil then gvalue = gvalue .. '  no home yet'; end
+
+    local gcol = at_home and accent or good;
+    if at_home and gfill >= 0.9 then gcol = bad;
+    elseif at_home and gfill >= 0.75 then gcol = warn; end
+    draw_meter(glabel, gvalue, gfill, pad, content_w, {
+        value_color = gcol,
+        from = vis.alpha(at_home and good or accent, 0.9),
+        to = at_home and vis.ramp3(good, warn, bad, gfill) or accent,
+    });
+    return true;
+end
+
 local function draw_mini_body(act, settings, pricing, pad, content_w, accent)
     local s = sess(act);
     local session_secs = M.get_session_seconds(act);
@@ -4266,10 +5752,13 @@ local function draw_mini_body(act, settings, pricing, pad, content_w, accent)
 
     -- Fatigue: the stop signal.
     local show_fatigue = settings.tracker.show_fatigue == nil or settings.tracker.show_fatigue[1];
+    if act ~= 'hunting' then
+        draw_global_meter(act, pad, content_w, accent, good, warn, bad);
+    end
     if cap ~= nil and cap > 0 and show_fatigue and act ~= 'hunting' then
         -- Fatigue is the server's allowance and clears on its own schedule, so
         -- it is counted separately from the session item total.
-        local items = s.items or 0;
+        local items = M.fatigue_items(act);   -- this zone's, when zone fatigue is on
         local left = math.max(0, cap - items);
         local fill = vis.clamp01(items / cap);
         local eta_str = nil;
@@ -4286,9 +5775,9 @@ local function draw_mini_body(act, settings, pricing, pad, content_w, accent)
         end
 
         -- Being capped is not the end of the night if the reset is minutes away.
-        local reset_left = M.fatigue_time_left();
+        local reset_left = M.fatigue_time_left(act);
         local value = fatigue_value(fill, items, cap, eta_str, reset_left,
-            content_w - text_w('Fatigue') - 12);
+            content_w - text_w(zone_fatigue_on(act) and 'Zone fatigue' or 'Fatigue') - 12);
 
         local value_c = accent;
         if fill >= 0.9 then
@@ -4300,7 +5789,7 @@ local function draw_mini_body(act, settings, pricing, pad, content_w, accent)
             value_c = good;   -- capped, but it comes back soon
         end
 
-        draw_meter('Fatigue', value, fill, pad, content_w, {
+        draw_meter(zone_fatigue_on(act) and 'Zone fatigue' or 'Fatigue', value, fill, pad, content_w, {
             value_color = value_c,
             from = vis.alpha(good, 0.9),
             to = vis.ramp3(good, warn, bad, fill),
@@ -4411,13 +5900,64 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
 
     -- The rate is meaningless in the first minutes; do not pretend otherwise.
     local rate_ready = session_secs >= RATE_WARMUP_S;
-    local hero_value = rate_ready and format.format_int(gph) or '--';
+
+    -- The hero glides to its new value rather than snapping. Same easing as
+    -- net gil above; a big number that jumps every sample reads as broken,
+    -- one that moves reads as live.
+    local hero_gph = gph;
+    if rate_ready and ui_flag(settings, 'animations', true) then
+        if s.anim_gph == nil or math.abs(gph - s.anim_gph) < 1 then
+            s.anim_gph = gph;
+        else
+            s.anim_gph = s.anim_gph + ((gph - s.anim_gph) * 0.15);
+        end
+        hero_gph = math.floor(s.anim_gph + 0.5);
+    else
+        s.anim_gph = gph;
+    end
+    local hero_value = rate_ready and format.format_int(hero_gph) or '--';
 
     draw_hero(act, settings, s, session_secs, hero_value, 'gil/hr', accent, pad, content_w);
 
-    -- Meta line: session clock, moon, Vana'diel day + time.
-    local clock = session_str .. (paused and ' (idle)' or '');
-    local meta = clock;
+    ------------------------------------------------------------------
+    -- Where you are standing, as tiles: session clock, moon, Vana'diel
+    -- day and time, weather. This used to be one pipe-joined line that
+    -- clipped from the right, so the last fact was the one never seen.
+    -- Each tile now truncates on its own.
+    --
+    -- A hand-paused session and an idle one both stop the clock, but they
+    -- are not the same thing to read: idle clears itself the moment you
+    -- swing again, a manual pause waits for you. Say which one it is.
+    ------------------------------------------------------------------
+    local hand_paused = sess(act).paused == true;
+    local clock_val = session_str;
+    local clock_col = light;
+    local clock_lab = 'Session';
+    if hand_paused then
+        clock_lab = 'Session - paused';
+        clock_col = theme.state_color('warn');
+    elseif paused then
+        clock_lab = 'Session - idle';
+        clock_col = vis.alpha(light, 0.7);
+    end
+
+    local tiles = T{};
+    -- The clock tile is the pause button. Clicking the thing being paused
+    -- is the most direct control there is, and it costs no extra row.
+    tiles:append({
+        label = clock_lab,
+        value = (hand_paused and '> ' or '|| ') .. clock_val,
+        color = clock_col,
+        on_click = function ()
+            if hand_paused then
+                M.resume_session(act);
+            else
+                M.pause_session(act);
+            end
+            M.session_dirty = true;
+        end,
+    });
+
     if settings.tracker.show_moon == nil or settings.tracker.show_moon[1] then
         local ts = vana.get_timestamp();
         local moon = vana.get_moon(ts);
@@ -4425,53 +5965,43 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
         local day_name = (weekday and weekday.name) or '';
         local moon_full = vana.format_moon(moon);
         local moon_pct = (moon and moon.percent ~= nil)
-            and (tostring(moon.percent) .. '%') or moon_full;
+            and (tostring(moon.percent) .. '%') or '';
         local vtime = vana.format_time(ts);
 
-        local function join(...)
-            local out = T{};
-            for _, v in ipairs({ ... }) do
-                if v ~= nil and v ~= '' then
-                    out:append(v);
-                end
-            end
-            return table.concat(out, '  |  ');
-        end
+        -- The moon tile carries the phase in its label and the percent as
+        -- its value, so a narrow tile still says "LQ" and "48%" rather than
+        -- cutting "Last Quarter 48%" off at "Last Qu".
+        local phase = (moon and moon.name) or moon_full;
+        local phase_lab = first_that_fits(
+            math.floor(content_w / 4) - 10, { phase, initials(phase) }) or initials(phase);
+        tiles:append({
+            label = 'Moon - ' .. phase_lab,
+            value = (moon_pct ~= '') and moon_pct or moon_full,
+        });
 
-        -- Live zone weather, read off the game's own packets. It rides the
-        -- meta line rather than taking a row of its own: it is a fact about
-        -- where you are standing, like the clock and the moon, and it is the
-        -- one ore gate you cannot work out in your head. The ore row only
-        -- appears in a dig zone, so without this there was nowhere to see it.
-        local wx_name = nil;
-        do
-            local w = weather.current();
-            if w.known then
-                wx_name = w.name;
-                if w.double then
-                    wx_name = wx_name .. ' x2';
-                end
-            elseif act == 'digging' then
-                -- Only the Dig tab admits to not knowing: weather is an ore
-                -- gate there, so its absence is information. Everywhere else
-                -- an unreadable sky is not worth a word.
-                wx_name = 'sky ?';
-            end
-        end
+        tiles:append({
+            label = (day_name ~= '') and day_name or 'Vana\'diel',
+            value = vtime,
+        });
 
-        -- Shed detail a piece at a time instead of chopping the last field in half.
-        meta = first_that_fits(content_w, {
-            join(clock, moon_full, day_name, vtime, wx_name),
-            join(clock, moon_pct, day_name, vtime, wx_name),
-            join(clock, moon_pct, vtime, wx_name),
-            join(clock, moon_full, day_name, vtime),
-            join(clock, moon_pct, day_name, vtime),
-            join(clock, moon_pct, vtime),
-            join(clock, vtime),
-        }) or clock;
+        -- Live zone weather, read off the game's own packets. It is the one
+        -- ore gate you cannot work out in your head. Only the Dig tab
+        -- admits to not knowing: weather is an ore gate there, so its
+        -- absence is information. Everywhere else an unreadable sky gets no
+        -- tile at all.
+        local w = weather.current();
+        if w.known then
+            tiles:append({
+                label = 'Weather',
+                value = w.name .. (w.double and ' x2' or ''),
+                color = w.double and accent or light,
+            });
+        elseif act == 'digging' then
+            tiles:append({ label = 'Weather', value = 'sky ?', color = muted });
+        end
     end
-    imgui.SetCursorPosX(pad);
-    ui.text_outlined_colored(truncate_to_width(meta, content_w), muted);
+
+    draw_tiles(tiles, pad, content_w, accent, transparent);
 
     -- Zone line with a stay/move verdict for the gathering tabs.
     if act ~= 'hunting' then
@@ -4602,15 +6132,17 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
         local hit_rate = (digs > 0) and ((found / digs) * 100) or 0;
         local dph = (session_secs > 0) and math.floor((digs / session_secs) * 3600) or 0;
 
-        local early = s.rejected or 0;
-        local digs_str = format.format_int(digs);
-        if early > 0 then
-            local with_early = digs_str .. string.format('   %d early', early);
-            if text_w(with_early) <= (content_w * 0.32) then
-                digs_str = with_early;
-            end
-        end
-        draw_stat_pair('Digs', digs_str, 'Digs/hr', format.format_int(dph),
+        -- Digs per minute rather than per hour. A dig is gated by a cooldown
+        -- you can feel, so a number around 4-6 is one you can actually judge
+        -- against; per-hour was a big abstract figure. Greens-left below
+        -- still carries the hourly story as a time estimate.
+        local dpm = (session_secs > 0) and ((digs / session_secs) * 60) or 0;
+
+        -- "Early" and "Rejected" were the same counter printed twice: both
+        -- were s.rejected, the server refusing with "you must wait longer".
+        -- One name is enough, and Rejected is the one that says what happened.
+        draw_stat_pair('Digs', format.format_int(digs),
+            'Digs/min', string.format('%.1f', dpm),
             pad, content_w, { c1 = light, c2 = accent });
         draw_stat_pair('Found', format.format_int(found) .. string.format('  %.0f%%', hit_rate),
             'Rejected', format.format_int(s.rejected or 0),
@@ -4622,21 +6154,76 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
         local green_cost = tool_cost(settings, act);
         local greens_left = tools;
         local left_str = format.format_int(greens_left);
+
+        -- What those greens are worth in items, at the rate you are actually
+        -- digging. Deliberately your own observed rate and not a formula:
+        -- Horizon is closed source and publishes no dig odds, so anything
+        -- else here would be a guess wearing a decimal point.
+        --
+        -- A dry zone pool overrides it. Once the zone says it has nothing
+        -- left, more greens buy nothing at all, and a cheerful estimate
+        -- would be the most misleading thing on the panel.
+        local eta_str = nil;
         if dph > 0 then
-            -- A green goes on nearly every dig, so stock over digs-per-hour
-            -- is honestly how long you can keep digging.
-            local hrs = greens_left / dph;
-            local mins = math.floor(hrs * 60 + 0.5);
-            local with_eta;
+            local mins = math.floor((greens_left / dph) * 60 + 0.5);
             if mins >= 60 then
-                with_eta = string.format('%s   ~%dh %02dm', left_str,
-                    math.floor(mins / 60), mins % 60);
+                eta_str = string.format('~%dh %02dm', math.floor(mins / 60), mins % 60);
             else
-                with_eta = string.format('%s   ~%dm', left_str, mins);
+                eta_str = string.format('~%dm', mins);
             end
-            local room = content_w * 0.5;
-            if text_w(with_eta) <= room then
-                left_str = with_eta;
+        end
+
+        -- Which accuracy to price the greens at. This used to insist on the
+        -- current session's rate, so the estimate was blank at the top of
+        -- every session - the exact moment you are deciding whether you have
+        -- enough greens - and wildly noisy for the first handful of digs
+        -- after that (one lucky dig out of two reads as 50%).
+        --
+        -- HGather's number is items/tries over counters it keeps forever, so
+        -- the lifetime rate is the closer match as well as the steadier one.
+        -- The session rate only takes over once it has enough digs behind it
+        -- to beat the lifetime figure as a predictor of this zone, today.
+        local EST_SESSION_MIN_DIGS = 25;
+        local life_acc = M.get_lifetime_dig_accuracy();
+        local est_rate, est_src = nil, nil;
+        if digs >= EST_SESSION_MIN_DIGS then
+            est_rate, est_src = hit_rate, 'session';
+        elseif life_acc ~= nil then
+            est_rate, est_src = life_acc, 'lifetime';
+        elseif digs > 0 then
+            est_rate, est_src = hit_rate, 'session';
+        end
+
+        local est_str = nil;
+        if s.zone_empty then
+            est_str = 'pool dry';
+        elseif est_rate ~= nil and greens_left > 0 then
+            est_str = string.format('~%s items',
+                format.format_int(math.floor((greens_left * (est_rate / 100)) + 0.5)));
+        end
+
+        -- The rate the estimate was priced at, so a number that appears before
+        -- you have dug anything this session is obviously coming from your
+        -- history rather than from nowhere.
+        local est_long = nil;
+        if est_str ~= nil and est_rate ~= nil and not s.zone_empty then
+            est_long = string.format('%s @ %.0f%%%s', est_str, est_rate,
+                (est_src == 'lifetime') and ' avg' or '');
+        end
+
+        -- Widest form that fits, dropping the time before the item estimate:
+        -- how much you will get matters more than how long it takes.
+        local room = content_w * 0.5;
+        for _, cand in ipairs({
+            (est_long and eta_str) and (left_str .. '   ' .. est_long .. '   ' .. eta_str) or nil,
+            est_long and (left_str .. '   ' .. est_long) or nil,
+            (est_str and eta_str) and (left_str .. '   ' .. est_str .. '   ' .. eta_str) or nil,
+            est_str and (left_str .. '   ' .. est_str) or nil,
+            eta_str and (left_str .. '   ' .. eta_str) or nil,
+        }) do
+            if text_w(cand) <= room then
+                left_str = cand;
+                break;
             end
         end
         local left_c = light;
@@ -4698,6 +6285,36 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             end
         end
 
+        -- Dig accuracy against your own lifetime average, the same readout
+        -- the HELM tabs carry. The average is built purely from digs you
+        -- have made - there is no published success rate to compare against,
+        -- so "am I running hot or cold tonight" is the honest question this
+        -- can answer, and the tick on the bar marks that average.
+        if (s.swings or 0) > 0 then
+            local life = M.get_lifetime_dig_accuracy();
+            local value = format.format_percent(hit_rate);
+            local value_c = light;
+            if life ~= nil then
+                value = value .. string.format('   avg %.1f%%', life);
+                if hit_rate >= life + 2 then
+                    value_c = good;
+                elseif hit_rate <= life - 2 then
+                    value_c = bad;
+                end
+            end
+            if show_bars then
+                draw_meter('Accuracy', value, hit_rate / 100, pad, content_w, {
+                    value_color = value_c,
+                    from = vis.alpha(accent, 0.55),
+                    to = accent,
+                    tick = (life ~= nil) and (life / 100) or nil,
+                    tick_color = vis.alpha(light, 0.6),
+                });
+            else
+                draw_row('Accuracy', value, value_c, pad, content_w);
+            end
+        end
+
         ------------------------------------------------------------------
         -- Elemental ore window. Four gates have to line up at once - rank,
         -- moon, weather and zone - and three of them change under you while
@@ -4752,17 +6369,29 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
         if s.assumed_weight then
             wt_value = wt_value .. ' ~';
         end
+        -- Two different numbers doing two different jobs, which is the part
+        -- that made this hard to fix from the outside: `fill` is how full
+        -- the bucket is and drives the BAR LENGTH, while the COLOUR is
+        -- driven by how likely the next find is to burst it. Changing fill
+        -- to fix the colour breaks the bar - which is exactly what Virhe
+        -- ran into. Keeping them separate fixes both.
+        local fill_tier, burst_pct = M.clam_fill_tier(wt, capacity);
         local wt_c = accent;
-        if fill >= 0.95 then
+        if fill_tier == 'stop' then
             wt_c = bad;
-        elseif fill >= 0.8 then
+        elseif fill_tier == 'risky' then
             wt_c = warn;
+        elseif fill_tier == 'watch' then
+            wt_c = light;
         end
         if show_bars then
+            -- The gradient tracks the same risk the colour does, so the bar
+            -- reddens as the danger rises rather than as the bar lengthens.
+            local heat = vis.clamp01(burst_pct / 40);
             draw_meter('Bucket', wt_value, fill, pad, content_w, {
                 value_color = wt_c,
                 from = vis.alpha(good, 0.9),
-                to = vis.ramp3(good, warn, bad, fill),
+                to = vis.ramp3(good, warn, bad, heat),
                 ticks = expert_on(settings) and { 0.25, 0.5, 0.75 } or nil,
             });
         else
@@ -4812,6 +6441,61 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
                 string.format('%.0f%%', risk.break_pct),
             }) or string.format('%.0f%%', risk.break_pct);
             draw_row('Risk', risk_str, risk_c, pad, content_w);
+        end
+
+        -- What is actually in the bucket. The weight meter says how close you
+        -- are to losing it; this says what you would be losing. Off by
+        -- default - it costs a line per item type - but if you price your own
+        -- haul it is the difference between a guess and a decision.
+        if settings.clamming and settings.clamming.show_bucket
+            and settings.clamming.show_bucket[1] and s.bucket ~= nil then
+
+            local with_prices = not (settings.clamming.bucket_prices
+                and settings.clamming.bucket_prices[1] == false);
+
+            -- Sort by what each line is worth, so the thing you would most
+            -- regret losing sits at the top. Unpriced items fall to the
+            -- bottom by value but keep their names visible.
+            local lines = T{};
+            for name, count in pairs(s.bucket) do
+                if (tonumber(count) or 0) > 0 then
+                    local unit = tonumber(pricing[normalize_key(name)]) or 0;
+                    lines:append({ name = name, count = count, unit = unit,
+                        worth = unit * count });
+                end
+            end
+
+            if #lines > 0 then
+                table.sort(lines, function (a, b)
+                    if a.worth ~= b.worth then return a.worth > b.worth; end
+                    return a.name < b.name;
+                end);
+
+                local carry = 0;
+                for _, it in ipairs(lines) do carry = carry + it.count; end
+                draw_rule_labeled(string.format('In bucket  x%d', carry),
+                    pad, content_w, accent, transparent);
+                for _, it in ipairs(lines) do
+                    local label = (it.count > 1)
+                        and string.format('%s x%d', it.name, it.count)
+                        or it.name;
+
+                    local value, value_c;
+                    if not with_prices then
+                        value = format.format_int(it.count);
+                        value_c = light;
+                    elseif it.unit > 0 then
+                        value = format.format_int(math.floor(it.worth + 0.5)) .. 'g';
+                        value_c = accent;
+                    else
+                        -- No price set for this one. Say so rather than
+                        -- printing 0g, which reads as worthless.
+                        value = 'no price';
+                        value_c = muted;
+                    end
+                    draw_row(label, value, value_c, pad, content_w);
+                end
+            end
         end
 
         -- Toh Zonikki offers the next bucket size at capacity minus five, so
@@ -4869,12 +6553,13 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             draw_row('Raw Gil', format.format_int(s.raw_gil or 0) .. 'g', accent, pad, content_w);
         end
     else
+        draw_global_meter(act, pad, content_w, accent, good, warn, bad);
         -- Fatigue: the number that decides when you go home.
         local show_fatigue = settings.tracker.show_fatigue == nil or settings.tracker.show_fatigue[1];
         if cap ~= nil and cap > 0 and show_fatigue then
             -- Fatigue is the server's allowance and clears on its own schedule, so
             -- it is counted separately from the session item total.
-            local items = s.items or 0;
+            local items = M.fatigue_items(act);   -- this zone's, when zone fatigue is on
             local left = math.max(0, cap - items);
             local fill = vis.clamp01(items / cap);
             local eta_str = nil;
@@ -4891,9 +6576,9 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             end
 
             -- Being capped is not the end of the night if the reset is minutes away.
-            local reset_left = M.fatigue_time_left();
+            local reset_left = M.fatigue_time_left(act);
             local value = fatigue_value(fill, items, cap, eta_str, reset_left,
-                content_w - text_w('Fatigue') - 12);
+                content_w - text_w(zone_fatigue_on(act) and 'Zone fatigue' or 'Fatigue') - 12);
 
             local value_c = accent;
             if fill >= 0.9 then
@@ -4906,19 +6591,22 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             end
 
             if show_bars then
-                draw_meter('Fatigue', value, fill, pad, content_w, {
+                draw_meter(zone_fatigue_on(act) and 'Zone fatigue' or 'Fatigue', value, fill, pad, content_w, {
                     value_color = value_c,
                     from = vis.alpha(good, 0.9),
                     to = vis.ramp3(good, warn, bad, fill),
                     ticks = expert_on(settings) and { 0.25, 0.5, 0.75 } or nil,
                 });
             else
-                draw_row('Fatigue', value, value_c, pad, content_w);
+                draw_row(zone_fatigue_on(act) and 'Zone fatigue' or 'Fatigue', value, value_c, pad, content_w);
             end
         end
 
-        -- Accuracy against your own lifetime average.
-        if show_bars and (s.swings or 0) > 0 then
+        -- Accuracy against your own lifetime average. Off by default: the
+        -- slot under Zone fatigue is optional now, and the figure is always
+        -- in /floos report and on Dig.
+        local show_acc = settings.tracker.show_accuracy ~= nil and settings.tracker.show_accuracy[1] == true;
+        if show_acc and (s.swings or 0) > 0 then
             local life = M.get_lifetime_accuracy();
             local value = format.format_percent(accuracy);
             local value_c = light;
@@ -4930,15 +6618,17 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
                     value_c = bad;
                 end
             end
-            draw_meter('Accuracy', value, accuracy / 100, pad, content_w, {
-                value_color = value_c,
-                from = vis.alpha(accent, 0.55),
-                to = accent,
-                tick = (life ~= nil) and (life / 100) or nil,
-                tick_color = vis.alpha(light, 0.6),
-            });
-        elseif not show_bars then
-            draw_row('Accuracy', format.format_percent(accuracy), light, pad, content_w);
+            if show_bars then
+                draw_meter('Accuracy', value, accuracy / 100, pad, content_w, {
+                    value_color = value_c,
+                    from = vis.alpha(accent, 0.55),
+                    to = accent,
+                    tick = (life ~= nil) and (life / 100) or nil,
+                    tick_color = vis.alpha(light, 0.6),
+                });
+            else
+                draw_row('Accuracy', value, value_c, pad, content_w);
+            end
         end
 
         if not compact then
@@ -4970,6 +6660,21 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
                 pad, content_w, { c1 = light, c2 = (s.breaks or 0) > 0 and warn or light });
             draw_stat_pair(TOOL_LABEL[act], format.format_int(tools), 'Break Cost', bcost_str,
                 pad, content_w, { c1 = tool_c, c2 = light });
+
+            -- Rotting timber. Logging only, and only once it has happened -
+            -- an always-present "0" would just be a row of noise on every
+            -- other tab. Shown next to its share of attempts because the
+            -- rate is the interesting part: it is the slice of your daily
+            -- allowance that bought you nothing.
+            local wasted = s.wasted or 0;
+            if act == 'logging' and wasted > 0 then
+                local wasted_str = format.format_int(wasted);
+                if (s.swings or 0) > 0 then
+                    wasted_str = wasted_str .. string.format('  %.1f%%',
+                        (wasted / s.swings) * 100);
+                end
+                draw_row('Rotting Timber', wasted_str, warn, pad, content_w);
+            end
         end
 
         -- Swing history strip.
@@ -4985,11 +6690,13 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
     local total_items = 0;
     local max_worth = 0;
     local worth_of = {};
+    local unit_of = {};
     for _, name in ipairs(names) do
         local count = s.rewards[name] or 0;
         local unit = tonumber(pricing[normalize_key(name)]) or 0;
         local total = unit * count;
         worth_of[name] = total;
+        unit_of[name] = unit;
         total_items = total_items + count;
         if total > max_worth then
             max_worth = total;
@@ -5075,6 +6782,12 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             end
         end
 
+        -- Captions sit OUTSIDE the scroll region, so they stay put while the
+        -- list moves under them. That also means they belong to the panel's
+        -- fixed chrome, which is measured for the shrink budget - the haul
+        -- floor rises by one row and the window simply refuses to go shorter.
+        draw_reward_header(pad, list_w);
+
         -- Always a child, scrolling or not, so the list measures the same on
         -- every frame and the budget above does not wobble as it crosses the
         -- threshold. Zero window padding keeps the rows exactly where they
@@ -5086,7 +6799,8 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             local measured = nil;
             for i, name in ipairs(names) do
                 draw_reward_row(name, s.rewards[name], worth_of[name] or 0, pad, width,
-                    (best_name ~= nil and name == best_name), total_items, accent, max_worth);
+                    (best_name ~= nil and name == best_name), total_items, accent, max_worth,
+                    unit_of[name] or 0);
                 if i == 1 then
                     measured = num_or(imgui.GetCursorPosY(), 0) - y0;
                 end
@@ -5099,16 +6813,29 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
         imgui.SetCursorPosX(0);
         local opened, began = ui.begin_child('FloosHaul##' .. tostring(act),
             { content_w + (pad * 2), haul_h }, false);
+
+        -- Whether the rows have already been put on screen. The fallback
+        -- below used to be gated purely on `began`, which meant an older
+        -- libs/ui.lua - one that returns a single value, so `began` comes
+        -- back nil - drew the whole haul a second time underneath. Every
+        -- item appeared twice, each claiming to be the best drop. Tracking
+        -- it explicitly makes a double draw impossible whichever version of
+        -- the ui library is installed.
+        local drew = false;
         if opened then
             draw_rows(list_w);
+            drew = true;
         end
         ui.end_child();
 
         pop_haul_style(vars, cols);
 
-        if began then
+        -- nil means "an old ui library that does not report this", which is
+        -- a success, not a failure. Only an explicit false means no child
+        -- window signature worked on this ImGui build.
+        if began ~= false then
             hm.used = haul_h;
-        else
+        elseif not drew then
             -- No child window on this ImGui build: draw the list plainly and
             -- report no give, so the panel's floor becomes its natural height
             -- and nothing ends up clipped.
@@ -5116,63 +6843,129 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             draw_rows(content_w);
             hm.rows = 0;
             hm.used = 0;
+        else
+            hm.rows = 0;
+            hm.used = 0;
         end
     end
 
-    draw_rule(pad, content_w, accent, transparent);
+    ------------------------------------------------------------------
+    -- Footer: the money.
+    --
+    -- Compact keeps the old two rows. Everything else gets the rate chart
+    -- and a row of tiles under it - net, rate, the last ten minutes with
+    -- its trend, lifetime - the same four figures the footer always
+    -- carried, laid out so they can be read side by side instead of
+    -- scanned top to bottom.
+    ------------------------------------------------------------------
+    if compact then
+        draw_rule(pad, content_w, accent, transparent);
+        draw_row('Net Gil', format.format_int(shown_gil) .. 'g', accent, pad, content_w);
+    else
+        local recent, trend = nil, nil;
+        if rate_ready then
+            recent = M.recent_rate(s, 600);
+            trend = M.rate_trend(recent, gph);
+        end
 
-    -- Footer: money, rate, lifetime.
-    draw_row('Net Gil', format.format_int(shown_gil) .. 'g', accent, pad, content_w);
-
-    if not compact then
-        local rate_str = rate_ready and (format.format_int(gph) .. ' gph') or 'warming up';
-        draw_row('Rate', rate_str, rate_ready and accent or muted, pad, content_w);
-
-        -- The hero is the whole-session average; this is what the last ten
-        -- minutes actually paid. The spread between them is the difference
-        -- between "good session" and "good session that just went cold".
-        if expert_on(settings) and rate_ready then
-            local recent = M.recent_rate(s, 600);
-            local trend = M.rate_trend(recent, gph);
-            if recent ~= nil then
-                local val = format.format_int(math.floor(recent + 0.5)) .. ' gph';
-                local col = light;
-                if trend ~= nil then
-                    val = val .. string.format('  %+.0f%%', trend);
-                    if trend >= 10 then
-                        col = good;
-                    elseif trend <= -25 then
-                        col = bad;
-                    elseif trend <= -10 then
-                        col = warn;
-                    end
+        -- The chart carries its own heading, so the rule above it names
+        -- what the picture is: the rate, and how far back it reaches.
+        local chart_drawn = false;
+        if ui_flag(settings, 'show_sparkline', true) then
+            local span_lab = 'Rate';
+            local smp = s.samples or {};
+            if #smp >= 3 then
+                local span = (smp[#smp].t or 0) - (smp[1].t or 0);
+                if span >= 90 then
+                    span_lab = string.format('Rate  -  last %dm', math.floor(span / 60 + 0.5));
                 end
-                draw_row('Last 10m', val, col, pad, content_w);
+            end
+            draw_rule_labeled(span_lab, pad, content_w, accent, transparent);
+            chart_drawn = draw_rate_chart(s, pad, content_w, accent, rate_ready and gph or nil);
+            if not chart_drawn then
+                -- Not enough history yet. Say so in the space the chart will
+                -- take, rather than letting the footer jump when it arrives.
+                imgui.SetCursorPosX(pad);
+                ui.text_outlined_colored('collecting samples...', vis.alpha(muted, 0.7));
+            end
+        else
+            draw_rule(pad, content_w, accent, transparent);
+        end
+
+        local rate_val = rate_ready and format.format_int(gph) or '--';
+        local rate_col = rate_ready and accent or muted;
+
+        local recent_val, recent_col = '--', muted;
+        if recent ~= nil then
+            recent_val = format.format_int(math.floor(recent + 0.5));
+            recent_col = light;
+            if trend ~= nil then
+                recent_val = recent_val .. string.format(' %+.0f%%', trend);
+                if trend >= 10 then
+                    recent_col = good;
+                elseif trend <= -25 then
+                    recent_col = bad;
+                elseif trend <= -10 then
+                    recent_col = warn;
+                end
             end
         end
 
-        if ui_flag(settings, 'show_sparkline', true) then
-            draw_rate_spark(s, pad, content_w, accent);
-        end
-
-        draw_row('Lifetime Gil', format.format_int(M.get_lifetime_gil()) .. 'g', vis.alpha(accent, 0.85), pad, content_w);
+        draw_tiles({
+            { label = 'Net',      value = format.format_int(shown_gil) .. 'g', color = accent },
+            { label = 'Gil/hr',   value = rate_val,   color = rate_col },
+            { label = 'Last 10m', value = recent_val, color = recent_col },
+            { label = 'Lifetime', value = format.format_int(M.get_lifetime_gil()) .. 'g',
+              color = vis.alpha(accent, 0.85) },
+        }, pad, content_w, accent, transparent);
 
         if sk ~= nil and skill_display_enabled(settings, act) and (s.skill_gain or 0) > 0 and session_secs > 0 then
             local skill_hr = (s.skill_gain / session_secs) * 3600;
             draw_row('Skill/hr', string.format('+%.1f', skill_hr), accent, pad, content_w);
         end
 
-        if act ~= 'hunting' then
-            local wr, mr, br = M.get_lifetime_wmb_rates();
+        -- Off by default. It is a long-run curiosity rather than something
+        -- you act on mid-session, and it needs hundreds of swings per bucket
+        -- before the three numbers mean anything - so it earns its place only
+        -- for people who deliberately turn it on.
+        if act ~= 'hunting' and ui_flag(settings, 'show_moon_rates', false) then
+            -- Skill-up rate by moon phase.
+            --
+            -- This replaced a W/M/B split, which was measuring whether the
+            -- swing's outcome predicted the skill-up. Three numbers that
+            -- always agree tell you nothing. The moon is at least a factor
+            -- the game is known to care about elsewhere, so it is worth a
+            -- lifetime record - even if the answer turns out to be "no
+            -- difference", which is a result in itself.
+            local nr, fr, orr, nsw, fsw, osw = M.get_lifetime_moon_rates();
             local row_y = num_or(imgui.GetCursorPosY(), 0);
             imgui.SetCursorPosX(pad);
             imgui.SetCursorPosY(row_y);
             ui.text_outlined_colored('Skillup Rate', muted);
 
+            -- Only name a winner once buckets have enough swings to mean
+            -- something, and only when there is another qualified bucket to
+            -- beat. Otherwise four lucky new-moon swings would read as a
+            -- finding, which is exactly the mistake this row exists to avoid.
+            local MOON_MIN = 50;
+            local cand = {
+                { r = nr or 0, n = nsw or 0 },
+                { r = fr or 0, n = fsw or 0 },
+                { r = orr or 0, n = osw or 0 },
+            };
+            local best, qualified = nil, 0;
+            for i, c in ipairs(cand) do
+                if c.n >= MOON_MIN then
+                    qualified = qualified + 1;
+                    if best == nil or c.r > cand[best].r then best = i; end
+                end
+            end
+            if qualified < 2 then best = nil; end
+
             local parts = {
-                { string.format('B %.0f%%', br or 0), bad },
-                { string.format('M %.0f%%', mr or 0), light },
-                { string.format('W %.0f%%', wr or 0), good },
+                { string.format('Norm %.1f%%', orr or 0), (best == 3) and good or light },
+                { string.format('Full %.1f%%', fr or 0), (best == 2) and good or light },
+                { string.format('New %.1f%%', nr or 0), (best == 1) and good or light },
             };
             local x = pad + content_w;
             for _, part in ipairs(parts) do
@@ -5202,6 +6995,148 @@ local function draw_activity_body(act, settings, pricing, pad, content_w, scale,
             end
         end
     end
+end
+
+----------------------------------------------------------------------
+-- Rank-up banner
+--
+-- Centred, five seconds, then gone. It is drawn as its own click-through
+-- window rather than inside the tracker panel because the panel may be
+-- hidden, small, or on the far side of the screen, and this is the one
+-- message worth putting in front of your eyes.
+--
+-- Deliberately no sound and no dismiss button: it interrupts for five
+-- seconds and then gets out of the way on its own.
+----------------------------------------------------------------------
+-- Ten seconds, not five. Five was long enough to draw and short enough to
+-- miss if you happened to be reading chat when it fired - and a rank arrives
+-- six times in a career, so there is no such thing as showing it too long.
+local TOAST_MS = 10000;     -- total life
+local TOAST_IN_MS = 220;    -- fade in
+local TOAST_OUT_MS = 900;   -- fade out, starts TOAST_OUT_MS before the end
+
+--- 0..1 opacity for the banner right now, or nil when nothing to show.
+local function toast_alpha()
+    local t = M.rank_toast;
+    if t == nil then
+        return nil;
+    end
+    local age = now_ms() - (t.at_ms or 0);
+    if age < 0 then age = 0; end   -- clock hiccup, not an expiry
+    if age > TOAST_MS then
+        M.rank_toast = nil;
+        return nil;
+    end
+    if age < TOAST_IN_MS then
+        return age / TOAST_IN_MS;
+    end
+    local left = TOAST_MS - age;
+    if left < TOAST_OUT_MS then
+        return left / TOAST_OUT_MS;
+    end
+    return 1;
+end
+
+--- Draw the banner. Called every frame from the addon's present handler,
+--- independently of whether the tracker panel itself is visible.
+--- Show the banner now, for /floos rankup.
+function M.preview_rank_toast(act, rank)
+    M.rank_toast = {
+        at_ms = now_ms(),
+        act = act or M.active_tab,
+        rank = rank or 'Test Rank',
+    };
+end
+
+function M.render_rank_toast(settings)
+    local a = toast_alpha();
+    if a == nil then
+        return;
+    end
+    if settings ~= nil and not ui_flag(settings, 'rank_toast', true) then
+        M.rank_toast = nil;
+        return;
+    end
+
+    local t = M.rank_toast;
+    local accent = accent_of(t.act or M.active_tab, settings or {});
+    local gold = theme.colors.text_gold or accent;
+    local light = theme.colors.text_light;
+
+    local title = 'RANK UP!';
+    local sub = t.rank or '';
+    if t.act ~= nil and TAB_LABELS[t.act] ~= nil then
+        sub = TAB_LABELS[t.act] .. '   ' .. sub;
+    end
+
+    -- Sit a little above centre, where the character stands, rather than
+    -- dead centre over the target's name plate.
+    local sw, sh = 1920, 1080;
+    pcall(function ()
+        local io = imgui.GetIO();
+        if io ~= nil and io.DisplaySize ~= nil then
+            sw = tonumber(io.DisplaySize.x) or sw;
+            sh = tonumber(io.DisplaySize.y) or sh;
+        end
+    end);
+
+    local scale_tag = fonts.begin_scale(1.6);
+    local tw = text_w(title);
+    fonts.end_scale(scale_tag);
+    local sub_w = text_w(sub);
+
+    local pad_x, pad_y = 26, 14;
+    local box_w = math.max(tw, sub_w) + (pad_x * 2);
+    local box_h = (line_h() * 1.6) + line_h() + (pad_y * 2) + 6;
+    local x = math.floor((sw - box_w) * 0.5);
+    local y = math.floor(sh * 0.34);
+
+    imgui.SetNextWindowPos({ x, y }, ImGuiCond_Always);
+    imgui.SetNextWindowSize({ box_w, box_h }, ImGuiCond_Always);
+    imgui.SetNextWindowBgAlpha(0);
+
+    local flags = bit.bor(
+        ImGuiWindowFlags_NoTitleBar,
+        ImGuiWindowFlags_NoResize,
+        ImGuiWindowFlags_NoMove,
+        ImGuiWindowFlags_NoScrollbar,
+        ImGuiWindowFlags_NoScrollWithMouse,
+        ImGuiWindowFlags_NoCollapse,
+        ImGuiWindowFlags_NoNav,
+        ImGuiWindowFlags_NoInputs,          -- click straight through it
+        ImGuiWindowFlags_NoFocusOnAppearing,
+        ImGuiWindowFlags_NoBringToFrontOnFocus,
+        ImGuiWindowFlags_NoSavedSettings,
+        ImGuiWindowFlags_NoBackground);
+
+    local open = { true };
+    if imgui.Begin('FloosRankUp##toast', open, flags) then
+        local dl = draw_list();
+        local ox, oy = imgui.GetWindowPos();
+        if type(ox) == 'table' then
+            oy = tonumber(ox.y or ox[2]) or y;
+            ox = tonumber(ox.x or ox[1]) or x;
+        end
+        ox = tonumber(ox) or x;
+        oy = tonumber(oy) or y;
+
+        -- Same furniture as the panel: dark plate, accent hairline top and
+        -- bottom, so it reads as part of the addon and not a stray toast.
+        if dl ~= nil then
+            vis.rect(dl, ox, oy, box_w, box_h, { 0, 0, 0, 0.72 * a }, 6);
+            vis.rect(dl, ox + 2, oy, box_w - 4, 2, vis.alpha(accent, 0.85 * a), 1);
+            vis.rect(dl, ox + 2, oy + box_h - 2, box_w - 4, 2, vis.alpha(accent, 0.85 * a), 1);
+        end
+
+        local tag = fonts.begin_scale(1.6);
+        imgui.SetCursorPos({ (box_w - tw) * 0.5, pad_y });
+        ui.text_outlined_colored(title, vis.alpha(gold, a));
+        fonts.end_scale(tag);
+
+        imgui.SetCursorPos({ (box_w - sub_w) * 0.5, pad_y + (line_h() * 1.6) + 4 });
+        ui.text_outlined_colored(sub, vis.alpha(light, a));
+    end
+    imgui.End();
 end
 
 function M.render(settings, pricing, preview)
@@ -5236,6 +7171,13 @@ function M.render(settings, pricing, preview)
                         break;
                     end
                 end
+            end
+            -- A clear counts as activity too: after /floos clear the tab you
+            -- are looking at is blank, and if every other tab is stale the
+            -- old rule hid the panel in your face.
+            if not any_recent and (M.woke_ms or 0) > 0
+                and ((now_ms() - M.woke_ms) / 1000) <= settings.tracker.display_timeout[1] then
+                any_recent = true;
             end
             local any_activity = false;
             for _, act in ipairs(ACTIVITIES) do

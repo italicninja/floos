@@ -10,6 +10,7 @@ local drawing = require('libs.drawing');
 local windowbackground = require('libs.windowbackground');
 local progressbar = require('libs.progressbar');
 local TextureManager = require('libs.texturemanager');
+local portrait = require('libs.portrait');
 local attribution = require('libs.attribution');
 local theme = require('libs.theme');
 
@@ -293,7 +294,8 @@ function M.get_background_options(settings, module_name)
         opts.borderOpacity = 0.0;
         opts.borderThickness = 0;
         opts.panel_bg_hex = '#000000';
-    elseif opts.theme == 'OceanBlue' or opts.theme == 'GreenGold' or opts.theme == 'DarkGold' then
+    elseif opts.theme == 'OceanBlue' or opts.theme == 'GreenGold' or opts.theme == 'DarkGold'
+        or opts.theme == 'Masuru' then
         local palette = theme.get_palette(opts.theme);
         opts.borderOpacity = opts.borderOpacity or 0.95;
         opts.panel_bg_hex = palette.panel_bg_hex;
@@ -340,25 +342,48 @@ function M.draw_plain_panel(draw_list, x, y, w, h, settings, module_name)
     draw_list:AddRectFilled({ bx, by }, { bx + bw, by + bh }, imgui.GetColorU32(bg), opts.panelRounding or 0);
 end
 
+--- The panel's own background, and then the optional portrait behind the
+--- content. Order matters: fill, picture, scrim, then whatever the caller
+--- draws next. The portrait goes in here rather than at the call site so
+--- every background style gets it, including Transparent - somebody running
+--- a transparent panel with a faded character behind it is a reasonable
+--- thing to want and there is no reason to make it a special case.
+local function draw_portrait_layer(draw_list, x, y, w, h, settings, opts)
+    local ui = settings ~= nil and settings.ui or nil;
+    if ui == nil or ui.bg_image == nil then return; end
+    local name = tostring(ui.bg_image[1] or '');
+    if name == '' or name == 'None' then return; end
+    local a = (ui.bg_image_alpha ~= nil) and (tonumber(ui.bg_image_alpha[1]) or 0) or 0;
+    local pad = (opts and opts.padding) or 8;
+    local ratio = (ui.bg_image_width ~= nil)
+        and tonumber(ui.bg_image_width[1]) or nil;
+    portrait.draw(draw_list, x - pad, y - pad, w + (pad * 2), h + (pad * 2),
+        name, a, (opts and opts.panelRounding) or 6, ratio);
+end
+
 function M.draw_panel_background(draw_list, x, y, w, h, settings, module_name)
     local opts = M.get_background_options(settings, module_name);
     local theme_name = opts.theme or 'DarkGold';
 
     if theme_name == 'Transparent' then
+        draw_portrait_layer(draw_list, x, y, w, h, settings, opts);
         return;
     end
 
     if theme_name == 'Plain' then
         M.draw_plain_panel(draw_list, x, y, w, h, settings, module_name);
+        draw_portrait_layer(draw_list, x, y, w, h, settings, opts);
         return;
     end
 
     if theme_name == 'Window1' then
         windowbackground.Draw(draw_list, x, y, w, h, opts);
+        draw_portrait_layer(draw_list, x, y, w, h, settings, opts);
         return;
     end
 
     M.draw_dark_panel(draw_list, x, y, w, h, settings, module_name);
+    draw_portrait_layer(draw_list, x, y, w, h, settings, opts);
 end
 
 function M.get_show_bookends(settings)

@@ -28,6 +28,19 @@ HELM detection logic (the 0x36 packet handshake and the chat-line outcome matchi
 is adapted from [HGather](https://github.com/SlowedHaste/HGather) by Hastega,
 maintained by SlowedHaste.
 
+## Menu detection (`libs/menu.lua`)
+
+The pointer walk that reads the name of the top-most game menu from
+`FFXiMain.dll`, and the table of menu names it is checked against, originate in
+[xitools](https://github.com/mousseng/xitools) by mousseng. Floos took them by
+way of [PetMe](https://github.com/m4thmatic/PetMe) and Metrics (by Metra of
+HorizonXI, BSD-3-Clause), both of which credit xitools as the source.
+
+The name table carries two corrections of Floos's own: `fulllog` is deliberately
+omitted, because the chat log expands every time you press Enter to type and
+hiding for it made the panel vanish whenever you talked; and `menuwind` was
+added after confirming from a live capture that it is the Commands list.
+
 ## Bundled fonts (`floos/assets/fonts/`)
 
 Optional overlay fonts (Tahoma, Tahoma Bold, Segoe UI, Consolas, Verdana) are
